@@ -928,7 +928,7 @@ class ObjectRangeFilter(object):
         gt_bboxes_3d.limit_yaw(offset=0.5, period=2 * np.pi)
         input_dict['gt_bboxes_3d'] = gt_bboxes_3d
         input_dict['gt_labels_3d'] = gt_labels_3d
-
+        input_dict['gt_bbox_rangemask'] = mask
         return input_dict
 
     def __repr__(self):
@@ -1010,7 +1010,7 @@ class ObjectNameFilter(object):
                                   dtype=np.bool_)
         input_dict['gt_bboxes_3d'] = input_dict['gt_bboxes_3d'][gt_bboxes_mask]
         input_dict['gt_labels_3d'] = input_dict['gt_labels_3d'][gt_bboxes_mask]
-
+        assert len(gt_labels_3d) == len(input_dict['gt_labels_3d'])
         return input_dict
 
     def __repr__(self):

@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import time
+
 import mmcv
 import numpy as np
 import torch
@@ -138,8 +140,10 @@ class LoadPointsFromMultiSweeps(object):
                  test_mode=False):
         self.load_dim = load_dim
         self.sweeps_num = sweeps_num
-        self.use_dim = use_dim
         self.time_dim = time_dim
+        if isinstance(use_dim, int):
+            use_dim = list(range(use_dim))
+        self.use_dim = use_dim
         assert time_dim < load_dim, \
             f'Expect the timestamp dimension < {load_dim}, got {time_dim}'
         self.file_client_args = file_client_args.copy()
@@ -459,7 +463,45 @@ class LoadPointsFromFile(object):
             points, points_dim=points.shape[-1], attribute_dims=attribute_dims)
         results['points'] = points
 
+        adjacent_points_list = []
+        for adj_index,adj in enumerate(results['adjacent']):
+            pts_filename = adj['lidar_path']
+            points = self._load_points(pts_filename)
+            points = points.reshape(-1, self.load_dim)
+            points = points[:, self.use_dim]
+            attribute_dims = None
+
+            if self.shift_height:
+                floor_height = np.percentile(points[:, 2], 0.99)
+                height = points[:, 2] - floor_height
+                points = np.concatenate(
+                    [points[:, :3],
+                     np.expand_dims(height, 1), points[:, 3:]], 1)
+                attribute_dims = dict(height=3)
+
+            if self.use_color:
+                assert len(self.use_dim) >= 6
+                if attribute_dims is None:
+                    attribute_dims = dict()
+                attribute_dims.update(
+                    dict(color=[
+                        points.shape[1] - 3,
+                        points.shape[1] - 2,
+                        points.shape[1] - 1,
+                    ]))
+
+            points_class = get_points_type(self.coord_type)
+            points = points_class(
+                points, points_dim=points.shape[-1], attribute_dims=attribute_dims)
+            # sweep['points'] = points
+            # results['adjacent'][adj_index]['points'] =points
+            adjacent_points_list.append(points)
+            # sweep_points_list.append(points)
+            # time.sleep(0.003)
+        results['adjacent_points_list']=adjacent_points_list
+
         return results
+
 
     def __repr__(self):
         """str: Return a string that describes the module."""
@@ -715,11 +757,11 @@ class PointToMultiViewDepth(object):
                     depth >= self.grid_config['depth'][0])
         coor, depth = coor[kept1], depth[kept1]
         ranks = coor[:, 0] + coor[:, 1] * width
-        sort = (ranks + depth / 100.).argsort()
+        sort = (ranks + depth / 100.).argsort()#返回从小到大索引
         coor, depth, ranks = coor[sort], depth[sort], ranks[sort]
 
         kept2 = torch.ones(coor.shape[0], device=coor.device, dtype=torch.bool)
-        kept2[1:] = (ranks[1:] != ranks[:-1])
+        kept2[1:] = (ranks[1:] != ranks[:-1])#如果两个点在一个像素中，就取近处的
         coor, depth = coor[kept2], depth[kept2]
         coor = coor.to(torch.long)
         depth_map[coor[:, 1], coor[:, 0]] = depth
@@ -935,16 +977,16 @@ class PrepareImageInputs(object):
             global2keyego @ sweepego2global @ sweepsensor2sweepego
 
         # global sensor to cur ego
-        w, x, y, z = key_info['cams'][cam_name]['ego2global_rotation']
-        keyego2global_rot = torch.Tensor(
-            Quaternion(w, x, y, z).rotation_matrix)
-        keyego2global_tran = torch.Tensor(
-            key_info['cams'][cam_name]['ego2global_translation'])
-        keyego2global = keyego2global_rot.new_zeros((4, 4))
-        keyego2global[3, 3] = 1
-        keyego2global[:3, :3] = keyego2global_rot
-        keyego2global[:3, -1] = keyego2global_tran
-        global2keyego = keyego2global.inverse()
+        # w, x, y, z = key_info['cams'][cam_name]['ego2global_rotation']
+        # keyego2global_rot = torch.Tensor(
+        #     Quaternion(w, x, y, z).rotation_matrix)
+        # keyego2global_tran = torch.Tensor(
+        #     key_info['cams'][cam_name]['ego2global_translation'])
+        # keyego2global = keyego2global_rot.new_zeros((4, 4))
+        # keyego2global[3, 3] = 1
+        # keyego2global[:3, :3] = keyego2global_rot
+        # keyego2global[:3, -1] = keyego2global_tran
+        # global2keyego = keyego2global.inverse()
 
         # cur ego to sensor
         w, x, y, z = key_info['cams'][cam_name]['sensor2ego_rotation']
@@ -973,7 +1015,7 @@ class PrepareImageInputs(object):
         results['cam_names'] = cam_names
         canvas = []
         sensor2sensors = []
-        for cam_name in cam_names:
+        for cam_name in cam_names:#每个摄像头都有自己的增强
             cam_data = results['curr']['cams'][cam_name]
             filename = cam_data['data_path']
             img = Image.open(filename)
@@ -1051,17 +1093,17 @@ class PrepareImageInputs(object):
                     rots_adj.append(rot)
                     trans_adj.append(tran)
                     sensor2sensors_adj.append(sensor2sensor)
-                rots.extend(rots_adj)
-                trans.extend(trans_adj)
-                sensor2sensors.extend(sensor2sensors_adj)
+                rots.extend(rots_adj)#从sweep sensor 到key ego 的变换
+                trans.extend(trans_adj)#从sweep sensor 到key ego 的变换
+                sensor2sensors.extend(sensor2sensors_adj) # keysensor2sweepsensor
         imgs = torch.stack(imgs)
 
-        rots = torch.stack(rots)
-        trans = torch.stack(trans)
-        intrins = torch.stack(intrins)
-        post_rots = torch.stack(post_rots)
-        post_trans = torch.stack(post_trans)
-        sensor2sensors = torch.stack(sensor2sensors)
+        rots = torch.stack(rots)#从sweep sensor 到key ego 的变换
+        trans = torch.stack(trans)#从sweep sensor 到key ego 平移
+        intrins = torch.stack(intrins)#相机内参，key 和sweep都一致
+        post_rots = torch.stack(post_rots)#图像数据增强
+        post_trans = torch.stack(post_trans)#图像数据增强
+        sensor2sensors = torch.stack(sensor2sensors)# keysensor2sweepsensor
         results['canvas'] = canvas
         results['sensor2sensors'] = sensor2sensors
         return (imgs, rots, trans, intrins, post_rots, post_trans)
@@ -1112,9 +1154,9 @@ class LoadAnnotationsBEVDepth(object):
         rot_mat = flip_mat @ (scale_mat @ rot_mat)
         if gt_boxes.shape[0] > 0:
             gt_boxes[:, :3] = (
-                rot_mat @ gt_boxes[:, :3].unsqueeze(-1)).squeeze(-1)
-            gt_boxes[:, 3:6] *= scale_ratio
-            gt_boxes[:, 6] += rotate_angle
+                rot_mat @ gt_boxes[:, :3].unsqueeze(-1)).squeeze(-1)#中心点旋转
+            gt_boxes[:, 3:6] *= scale_ratio#whl缩放
+            gt_boxes[:, 6] += rotate_angle#朝向角度
             if flip_dx:
                 gt_boxes[:,
                          6] = 2 * torch.asin(torch.tensor(1.0)) - gt_boxes[:,
@@ -1127,7 +1169,7 @@ class LoadAnnotationsBEVDepth(object):
 
     def __call__(self, results):
         gt_boxes, gt_labels = results['ann_infos']
-        gt_boxes, gt_labels = torch.Tensor(gt_boxes), torch.tensor(gt_labels)
+        gt_boxes, gt_labels = torch.Tensor(np.array(gt_boxes)), torch.tensor(np.array(gt_labels))
         rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation(
         )
         bda_mat = torch.zeros(4, 4)
@@ -1145,4 +1187,595 @@ class LoadAnnotationsBEVDepth(object):
         post_rots, post_trans = results['img_inputs'][4:]
         results['img_inputs'] = (imgs, rots, trans, intrins, post_rots,
                                  post_trans, bda_rot)
+
+        results['bev_pts_aug'] = (rotate_bda, scale_bda, flip_dx, flip_dy)
         return results
+
+
+@PIPELINES.register_module()
+class LoadSweepsAnnotationsBEVDepth(object):
+
+    def __init__(self, bda_aug_conf, classes, is_train=True):
+        self.bda_aug_conf = bda_aug_conf
+        self.is_train = is_train
+        self.classes = classes
+
+    def sample_bda_augmentation(self):
+        """Generate bda augmentation values based on bda_config."""
+        if self.is_train:
+            rotate_bda = np.random.uniform(*self.bda_aug_conf['rot_lim'])
+            scale_bda = np.random.uniform(*self.bda_aug_conf['scale_lim'])
+            flip_dx = np.random.uniform() < self.bda_aug_conf['flip_dx_ratio']
+            flip_dy = np.random.uniform() < self.bda_aug_conf['flip_dy_ratio']
+        else:
+            rotate_bda = 0
+            scale_bda = 1.0
+            flip_dx = False
+            flip_dy = False
+        return rotate_bda, scale_bda, flip_dx, flip_dy
+
+    def bev_transform(self, gt_boxes, rotate_angle, scale_ratio, flip_dx,
+                      flip_dy):
+        rotate_angle = torch.tensor(rotate_angle / 180 * np.pi)
+        rot_sin = torch.sin(rotate_angle)
+        rot_cos = torch.cos(rotate_angle)
+        rot_mat = torch.Tensor([[rot_cos, -rot_sin, 0], [rot_sin, rot_cos, 0],
+                                [0, 0, 1]])
+        scale_mat = torch.Tensor([[scale_ratio, 0, 0], [0, scale_ratio, 0],
+                                  [0, 0, scale_ratio]])
+        flip_mat = torch.Tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        if flip_dx:
+            flip_mat = flip_mat @ torch.Tensor([[-1, 0, 0], [0, 1, 0],
+                                                [0, 0, 1]])
+        if flip_dy:
+            flip_mat = flip_mat @ torch.Tensor([[1, 0, 0], [0, -1, 0],
+                                                [0, 0, 1]])
+        rot_mat = flip_mat @ (scale_mat @ rot_mat)
+        if gt_boxes.shape[0] > 0:
+            gt_boxes[:, :3] = (
+                rot_mat @ gt_boxes[:, :3].unsqueeze(-1)).squeeze(-1)#中心点旋转
+            gt_boxes[:, 3:6] *= scale_ratio#whl缩放
+            gt_boxes[:, 6] += rotate_angle#朝向角度
+            if flip_dx:
+                gt_boxes[:,
+                         6] = 2 * torch.asin(torch.tensor(1.0)) - gt_boxes[:,
+                                                                           6]
+            if flip_dy:
+                gt_boxes[:, 6] = -gt_boxes[:, 6]
+            gt_boxes[:, 7:] = (
+                rot_mat[:2, :2] @ gt_boxes[:, 7:].unsqueeze(-1)).squeeze(-1)
+        return gt_boxes, rot_mat
+
+    def __call__(self, results):
+
+        (imgs, rots, trans, intrins, post_rots, post_trans, bda_rot) = results['img_inputs']
+        (rotate_bda, scale_bda, flip_dx, flip_dy) = results['bev_pts_aug']
+
+        results["sweeps_gt_boxes"] = list()
+        results["sweeps_gt_labels"] = list()
+        results["adjego2currego"] = list()
+
+        # N, _, H, W = imgs.shape
+        N = len(results["adjacent"])+1
+        extra = [
+            rots.view(N, 6, 3, 3),
+            trans.view(N, 6, 3),
+        ]
+        extra = [torch.split(t, 1, 1) for t in extra]
+        extra = [[p.squeeze(1) for p in t] for t in extra]
+        rots, trans = extra
+
+        # n, c, h, w = imgs.shape
+        # _, v, _ = trans[0].shape
+        # get transformation from current ego frame to adjacent ego frame
+        # transformation from current camera frame to current ego frame
+        c02l0 = torch.zeros((4, 4), dtype=rots[0].dtype).to(rots[0])
+        c02l0[:3, :3] = rots[0][0]
+        c02l0[:3, 3] = trans[0][0]
+        c02l0[3, 3] = 1
+
+
+        # add bev data augmentation
+        # bda_ = torch.zeros((4, 4), dtype=rots[0].dtype).to(rots[0])
+        # bda_[:3, :3] = bda_rot
+        # bda_[3, 3] = 1
+        # c02l0 = bda_.matmul(c02l0)
+
+
+        for ind, sweep_ann_infos in enumerate(results['adjacent']):
+            # transformation from adjacent camera frame to current ego frame
+            c12l0 = torch.zeros((4, 4), dtype=rots[0].dtype).to(rots[0])
+            c12l0[:3, :3] = rots[0][ind+1]
+            c12l0[:3, 3] = trans[0][ind+1]
+            c12l0[3, 3] = 1
+            # c12l0 = bda_.matmul(c12l0)
+            # transformation from current ego frame to adjacent ego frame
+            l02l1 = c02l0.matmul(torch.inverse(c12l0))
+            l12l0 = torch.inverse(l02l1)
+            '''
+              c02l0 * inv(c12l0)
+            = c02l0 * inv(l12l0 * c12l1)
+            = c02l0 * inv(c12l1) * inv(l12l0)
+            = l02l1 # c02l0==c12l1
+            '''
+
+
+            sweep_gt_boxes, sweep_gt_labels = sweep_ann_infos['ann_infos']
+            sweep_gt_boxes, sweep_gt_labels = torch.Tensor(np.array(sweep_gt_boxes)), torch.tensor(np.array(sweep_gt_labels))
+
+            # sweep_gt_boxes[:,0:3] = (l02l1[:3,:3] @ sweep_gt_boxes[:,0:3].unsqueeze(-1) + l02l1[:3,3].unsqueeze(-1)).squeeze(-1)
+            # sweep_gt_boxes_t = LiDARInstance3DBoxes(sweep_gt_boxes, box_dim=sweep_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
+            # sweep_gt_boxes_t = sweep_gt_boxes_t.rotate(l02l1[:3, :3])
+            # sweep_gt_boxes_t.rotate(bda_rot)
+
+            sweep_gt_boxes, bda_rot = self.bev_transform(sweep_gt_boxes, rotate_bda, scale_bda,flip_dx, flip_dy)
+
+            #gt bbox convert to current frame
+            # rot_sin = (l12l0[0, 1]+l12l0[1,0])/2
+            # rot_cos = (l12l0[0, 0]+l12l0[1,1])/2
+            # angle = np.arctan2(rot_sin, rot_cos)
+            # sweep_gt_boxes[:, 0:3] = sweep_gt_boxes[:, 0:3] @ l12l0[:3, :3]+l12l0[:3, 3]
+            # sweep_gt_boxes[:, 6] -= angle
+            # # rotate velo vector
+            # sweep_gt_boxes[:, 7:9] = sweep_gt_boxes[:, 7:9] @ l12l0[:2, :2]
+
+            sweep_gt_boxes = LiDARInstance3DBoxes(sweep_gt_boxes, box_dim=sweep_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
+            results["sweeps_gt_boxes"].append(sweep_gt_boxes)
+            results["sweeps_gt_labels"].append(sweep_gt_labels)
+            results["adjego2currego"].append(l12l0)
+
+        return results
+
+@PIPELINES.register_module()
+class PointToGridStructure(object):
+
+    def __init__(self, grid_config, point_cloud_range,grid_minpts=5):
+        self.grid_minpts = grid_minpts
+        self.grid_config = grid_config
+        self.create_grid_infos(**grid_config)
+        self.point_cloud_range = point_cloud_range
+
+    def create_grid_infos(self, x, y, z, **kwargs):
+        """Generate the grid information including the lower bound, interval,
+        and size.
+
+        Args:
+            x (tuple(float)): Config of grid alone x axis in format of
+                (lower_bound, upper_bound, interval).
+            y (tuple(float)): Config of grid alone y axis in format of
+                (lower_bound, upper_bound, interval).
+            z (tuple(float)): Config of grid alone z axis in format of
+                (lower_bound, upper_bound, interval).
+            **kwargs: Container for other potential parameters
+        """
+        self.grid_lower_bound = torch.Tensor([cfg[0] for cfg in [x, y, z]])
+        self.grid_interval = torch.Tensor([cfg[2] for cfg in [x, y, z]])
+        self.grid_size = torch.Tensor([(cfg[1] - cfg[0]) / cfg[2]
+                                       for cfg in [x, y, z]])
+
+    def __call__(self, results):
+        points_lidar = results['points']
+        post_rots, post_trans, bda = results['img_inputs'][4:]
+
+        #lidar2ego Coordinate
+        lidar2lidarego = np.eye(4, dtype=np.float32)
+        lidar2lidarego[:3, :3] = Quaternion(
+            results['curr']['lidar2ego_rotation']).rotation_matrix
+        lidar2lidarego[:3, 3] = results['curr']['lidar2ego_translation']
+        lidar2lidarego = torch.from_numpy(lidar2lidarego)
+        points_lidar.tensor[:, :3] = points_lidar.tensor[:, :3].matmul(
+            lidar2lidarego[:3, :3].T) + lidar2lidarego[:3, 3].unsqueeze(0)
+
+
+        points_lidar.rotate(bda)
+        points_kept_flag = points_lidar.in_range_3d(self.point_cloud_range)
+        points_lidar = points_lidar[points_kept_flag]
+
+        num_points, _ = points_lidar.shape
+
+        coor = ((points_lidar.coord - self.grid_lower_bound.to(points_lidar.device)) /
+                self.grid_interval.to(points_lidar.device))
+        coor = coor.long().view(num_points, 3)
+
+        # get tensors from the same voxel next to each other
+        # ranks_bev = coor[:, 2] * (self.grid_size[1] * self.grid_size[0])
+        ranks_bev = coor[:, 0] * self.grid_size[0] + coor[:, 1]
+        order = ranks_bev.argsort()
+        ranks_bev = ranks_bev[order]
+        # points_lidar = points_lidar[order]
+        kept = torch.ones(
+            ranks_bev.shape[0], device=ranks_bev.device, dtype=torch.bool)
+        kept[1:] = ranks_bev[1:] != ranks_bev[:-1]
+        interval_starts = torch.where(kept)[0].int()
+        interval_lengths = torch.zeros_like(interval_starts)
+        interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
+        interval_lengths[-1] = ranks_bev.shape[0] - interval_starts[-1]
+
+        kept2 = interval_lengths[:] >= self.grid_minpts#保留点数大于等于self.grid_minpts的点
+        interval_starts = interval_starts[kept2]
+        # interval_lengths = interval_lengths[kept2]
+        grid_mask_rank = ranks_bev[interval_starts.long()]
+
+        grid_mask = torch.zeros(
+            int(self.grid_size[1] * self.grid_size[0]), device=ranks_bev.device, dtype=torch.float)
+        grid_mask[grid_mask_rank.long()] = 1.0  # 满足最小点数条件的grid的mask为1
+
+        # try:
+        #     grid_mask[grid_mask_rank.long()] = 1.0  # 满足最小点数条件的grid的mask为1
+        # except:
+        #     aa = 2
+
+        # grid_pts_list = [points_lidar.tensor[start:start + lengths, :3] for start, lengths in
+        #                  zip(interval_starts, interval_lengths)]
+        # grid_pts_relativehigh = [
+        #     (grid_pts[:, 2].max() - grid_pts[:, 2].min()) / (self.point_cloud_range[5] - self.point_cloud_range[2]) for
+        #     grid_pts in grid_pts_list]
+        # grid_high = torch.zeros(
+        #     int(self.grid_size[1] * self.grid_size[0]), device=ranks_bev.device, dtype=torch.float)
+        # grid_high[grid_mask_rank.long()] = torch.tensor(grid_pts_relativehigh)
+
+        gt_grid_mask = grid_mask.view(int(self.grid_size[2]), int(self.grid_size[0]), int(self.grid_size[1]))
+        # gt_grid_high = grid_high.view(int(self.grid_size[2]), int(self.grid_size[0]), int(self.grid_size[1]))
+
+        # results['gt_bev_high'] = (gt_grid_mask, gt_grid_high)
+        results['gt_bev_mask'] = gt_grid_mask
+        # results['gt_bev_high'] = gt_grid_high
+
+        adjacent_gt_bev_masks = []
+        for index, adj in enumerate(results['adjacent']):
+            # if index < len(results['sweeps']):
+            # assert adj['timestamp'] == results['sweeps'][index]['timestamp']
+            points_lidar = results['adjacent_points_list'][index]
+            adj2current = results['adjego2currego'][index]
+
+            _, _, bda = results['img_inputs'][4:]
+
+            # lidar2ego Coordinate
+            lidar2lidarego = np.eye(4, dtype=np.float32)
+            lidar2lidarego[:3, :3] = Quaternion(
+                adj['lidar2ego_rotation']).rotation_matrix
+            lidar2lidarego[:3, 3] = adj['lidar2ego_translation']
+            lidar2lidarego = torch.from_numpy(lidar2lidarego)
+            points_lidar.tensor[:, :3] = points_lidar.tensor[:, :3].matmul(
+                lidar2lidarego[:3, :3].T) + lidar2lidarego[:3, 3].unsqueeze(0)
+
+            # points_lidar = points_lidars.clone()
+            points_lidar.rotate(bda)
+
+            #pts convert to current frame
+            points_lidar.tensor[:,:3] = points_lidar.tensor[:,:3] @ adj2current[:3, :3]+adj2current[:3, 3]
+
+
+            points_kept_flag = points_lidar.in_range_3d(self.point_cloud_range)
+            points_lidar = points_lidar[points_kept_flag]
+
+            num_points, _ = points_lidar.shape
+
+            coor = ((points_lidar.coord - self.grid_lower_bound.to(points_lidar.device)) /
+                    self.grid_interval.to(points_lidar.device))
+            coor = coor.long().view(num_points, 3)
+
+            # get tensors from the same voxel next to each other
+            # ranks_bev = coor[:, 2] * (self.grid_size[1] * self.grid_size[0])
+            ranks_bev = coor[:, 0] * self.grid_size[0] + coor[:, 1]
+            order = ranks_bev.argsort()
+            ranks_bev = ranks_bev[order]
+            # points_lidar = points_lidar[order]
+            kept = torch.ones(
+                ranks_bev.shape[0], device=ranks_bev.device, dtype=torch.bool)
+            kept[1:] = ranks_bev[1:] != ranks_bev[:-1]
+            interval_starts = torch.where(kept)[0].int()
+            interval_lengths = torch.zeros_like(interval_starts)
+            interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
+            interval_lengths[-1] = ranks_bev.shape[0] - interval_starts[-1]
+
+            kept2 = interval_lengths[:] >= 1  # 保留点数大于等于self.grid_minpts的点
+            interval_starts = interval_starts[kept2]
+            # interval_lengths = interval_lengths[kept2]
+            grid_mask_rank = ranks_bev[interval_starts.long()]
+
+            grid_mask = torch.zeros(
+                int(self.grid_size[1] * self.grid_size[0]), device=ranks_bev.device, dtype=torch.float)
+            grid_mask[grid_mask_rank.long()] = 1.0  # 满足最小点数条件的grid的mask为1
+
+            # try:
+            #     grid_mask[grid_mask_rank.long()] = 1.0  # 满足最小点数条件的grid的mask为1
+            # except:
+            #     aa = 2
+
+
+            # grid_pts_list = [points_lidar.tensor[start:start + lengths, :3] for start, lengths in
+            #                  zip(interval_starts, interval_lengths)]
+            # grid_pts_relativehigh = [
+            #     (grid_pts[:, 2].max() - grid_pts[:, 2].min()) / (
+            #                 self.point_cloud_range[5] - self.point_cloud_range[2]) for
+            #     grid_pts in grid_pts_list]
+            # grid_high = torch.zeros(
+            #     int(self.grid_size[1] * self.grid_size[0]), device=ranks_bev.device, dtype=torch.float)
+            # grid_high[grid_mask_rank.long()] = torch.tensor(grid_pts_relativehigh)
+
+            gt_grid_mask = grid_mask.view(int(self.grid_size[2]), int(self.grid_size[0]), int(self.grid_size[1]))
+            # gt_grid_high = grid_high.view(int(self.grid_size[2]), int(self.grid_size[0]), int(self.grid_size[1]))
+
+            # results['sweeps'][index]['gt_bev_high'] = (gt_grid_mask, gt_grid_high)
+            # results['adjacent'][index]['gt_bev_mask'] = gt_grid_mask
+            # results['adjacent'][index]['gt_bev_high'] = gt_grid_high
+            adjacent_gt_bev_masks.append(gt_grid_mask)
+
+        adjacent_gt_bev_masks = torch.stack(adjacent_gt_bev_masks).squeeze(1)
+        results['adjacent_gt_bev_masks'] = adjacent_gt_bev_masks
+
+        return results
+
+@PIPELINES.register_module()
+class BEVObjectCornerAnnotation(object):
+
+    def __init__(self, grid_config, point_cloud_range, lidar_guided=False, grid_minpts=5):
+        self.grid_minpts = grid_minpts
+        self.grid_config = grid_config
+        self.create_grid_infos(**grid_config)
+        self.point_cloud_range = point_cloud_range
+        self.lidar_guided = lidar_guided
+    def bev_transform(self, gt_boxes, rotate_angle, scale_ratio, flip_dx,
+                      flip_dy):
+        rotate_angle = torch.tensor(rotate_angle / 180 * np.pi)
+        rot_sin = torch.sin(rotate_angle)
+        rot_cos = torch.cos(rotate_angle)
+        rot_mat = torch.Tensor([[rot_cos, -rot_sin, 0], [rot_sin, rot_cos, 0],
+                                [0, 0, 1]])
+        scale_mat = torch.Tensor([[scale_ratio, 0, 0], [0, scale_ratio, 0],
+                                  [0, 0, scale_ratio]])
+        flip_mat = torch.Tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        if flip_dx:
+            flip_mat = flip_mat @ torch.Tensor([[-1, 0, 0], [0, 1, 0],
+                                                [0, 0, 1]])
+        if flip_dy:
+            flip_mat = flip_mat @ torch.Tensor([[1, 0, 0], [0, -1, 0],
+                                                [0, 0, 1]])
+        rot_mat = flip_mat @ (scale_mat @ rot_mat)
+        if gt_boxes.shape[0] > 0:
+            gt_boxes[:, :3] = (
+                rot_mat @ gt_boxes[:, :3].unsqueeze(-1)).squeeze(-1)#中心点旋转
+            gt_boxes[:, 3:6] *= scale_ratio#whl缩放
+            gt_boxes[:, 6] += rotate_angle#朝向角度
+            if flip_dx:
+                gt_boxes[:,
+                         6] = 2 * torch.asin(torch.tensor(1.0)) - gt_boxes[:,
+                                                                           6]
+            if flip_dy:
+                gt_boxes[:, 6] = -gt_boxes[:, 6]
+            gt_boxes[:, 7:] = (
+                rot_mat[:2, :2] @ gt_boxes[:, 7:].unsqueeze(-1)).squeeze(-1)
+        return gt_boxes, rot_mat
+
+    def create_grid_infos(self, x, y, z, **kwargs):
+        """Generate the grid information including the lower bound, interval,
+        and size.
+
+        Args:
+            x (tuple(float)): Config of grid alone x axis in format of
+                (lower_bound, upper_bound, interval).
+            y (tuple(float)): Config of grid alone y axis in format of
+                (lower_bound, upper_bound, interval).
+            z (tuple(float)): Config of grid alone z axis in format of
+                (lower_bound, upper_bound, interval).
+            **kwargs: Container for other potential parameters
+        """
+        self.grid_lower_bound = torch.Tensor([cfg[0] for cfg in [x, y, z]])
+        self.grid_interval = torch.Tensor([cfg[2] for cfg in [x, y, z]])
+        self.grid_size = torch.Tensor([(cfg[1] - cfg[0]) / cfg[2]
+                                       for cfg in [x, y, z]])
+
+    def __call__(self, results):
+
+        gt_bbox_mask = results['gt_bbox_rangemask']
+        curr_gt_bboxes_3d = results['gt_bboxes_3d']
+        curr_gt_labels_3d = results['gt_labels_3d']
+
+        gt_bev_mask = results['gt_bev_mask']
+        # gt_bev_high = results['gt_bev_high']
+
+        raw_index = list(range(len(gt_bbox_mask)))
+        gt_bbox_index = [index for index in raw_index if gt_bbox_mask[index] == True]
+
+        # (_, rots, trans, intrins, post_rots,
+        #  post_trans, bda_rot) = results['img_inputs']
+
+        curr_gt_bboxes_3d = curr_gt_bboxes_3d.corners[...,:2]
+        (curr_corner_x6y6, x0y0, x0y1, curr_corner_x8y8, curr_corner_x0y0, x1y0, x1y1, curr_corner_x2y2) = torch.split(curr_gt_bboxes_3d, 1, dim=1)
+        # use 9 corner discript one object
+        # x0y0z0    x1y1z1    x2y2z2
+        # x3y3z3    x4y4z4    x5y5z5
+        # x6y6z6    x7y7z7    x8y8z8
+        curr_corner_x1y1 = (curr_corner_x0y0 + curr_corner_x2y2) / 2
+        curr_corner_x3y3 = (curr_corner_x0y0 + curr_corner_x6y6) / 2
+        curr_corner_x7y7 = (curr_corner_x8y8 + curr_corner_x6y6) / 2
+        curr_corner_x5y5 = (curr_corner_x8y8 + curr_corner_x2y2) / 2
+        curr_corner_x4y4 = (curr_corner_x3y3 + curr_corner_x5y5) / 2
+
+        curr_corner_points = torch.cat(
+            [curr_corner_x0y0, curr_corner_x1y1, curr_corner_x2y2, curr_corner_x3y3, curr_corner_x4y4,
+             curr_corner_x5y5, curr_corner_x6y6, curr_corner_x7y7, curr_corner_x8y8], dim=1)
+
+        curr_corner_coor = ((curr_corner_points - self.grid_lower_bound[:2].to(curr_corner_points.device)) /
+                self.grid_interval[:2].to(curr_corner_points.device))
+        curr_corner_coor = curr_corner_coor
+
+        valid_corner_mask = ((curr_corner_coor[:, :, 0] < 0) |
+                             (curr_corner_coor[:, :, 0] >= self.grid_size[0]) |
+                             (curr_corner_coor[:, :, 1] < 0) |
+                             (curr_corner_coor[:, :, 1] >= self.grid_size[1]))
+        valid_corner_mask = valid_corner_mask.unsqueeze(dim=-1).expand_as(curr_corner_coor)
+
+        curr_corner_coor[valid_corner_mask] = -1
+
+        curr_corner_tensor = torch.zeros(len(gt_bbox_index), 9, 2 * (len(results['adjacent']) + 1), dtype=torch.float)
+
+        curr_corner_mask = torch.zeros((len(gt_bbox_index), 1 * (len(results['adjacent']) + 1),9,9), dtype=torch.long)
+        curr_corner_tensor[:, :, :2] = curr_corner_coor
+
+        if self.lidar_guided:
+            # 将gt_bev_mask中x和y坐标的索引是否大于0的信息添加到curr_corner_coor的第三个维度中
+            mask = torch.tensor(
+                [gt_bev_mask[..., curr_corner_coor[i, j, 0].long(), curr_corner_coor[i, j, 1].long()] for i in
+                 range(curr_corner_coor.shape[0]) for j in range(curr_corner_coor.shape[1])], dtype=torch.float32)
+            mask = mask.reshape(curr_corner_coor.shape[0], curr_corner_coor.shape[1], 1)
+            # curr_corner_coor = torch.cat((curr_corner_coor[..., :2], mask), dim=-1).long()
+            # nonzero_idx = torch.nonzero(curr_corner_coor_t[:,:,-1])
+
+            # row_indices, col_indices, depth_indices = torch.where(mask == 1)
+            # curr_corner_mask[:, depth_indices, row_indices, row_indices[:, None]] = 1
+            for i,obj_mask in enumerate(mask):
+                row_indices, col_indices = torch.where(obj_mask == 1)
+                curr_corner_mask[i, 0, row_indices, row_indices[:, None]] = 1
+
+        # import matplotlib.pyplot as plt
+        # plt.imshow(gt_bev_mask.squeeze(0).numpy(), cmap='binary')
+        # plt.show()
+        # # gt_bev_mask_b = torch.zeros_like(gt_bev_mask)
+        # gt_bev_mask_b = gt_bev_mask.clone()
+        # for i in range(curr_corner_coor.shape[0]):
+        #     for j in range(curr_corner_coor.shape[1]):
+        #         gt_bev_mask_b[:,curr_corner_coor[i, j, 0].long(),curr_corner_coor[i, j, 1].long()] = 2
+        # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
+        # plt.show()
+        #
+        # gt_bev_mask_b = gt_bev_mask.clone()
+        # for i in range(curr_corner_coor.shape[0]):
+        #     for j in range(curr_corner_coor.shape[1]):
+        #         if curr_corner_mask[i,0, j, 0] == 0:
+        #             gt_bev_mask_b[:,curr_corner_coor[i, j, 0].long(),curr_corner_coor[i, j, 1].long()] = 2
+        # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
+        # plt.show()
+        #
+        # gt_bev_mask_b = gt_bev_mask.clone()
+        # for i in range(curr_corner_coor.shape[0]):
+        #     for j in range(curr_corner_coor.shape[1]):
+        #         if curr_corner_mask[i,0, j, 0] == 1:
+        #             gt_bev_mask_b[:,curr_corner_coor[i, j, 0].long(),curr_corner_coor[i, j, 1].long()] = 3
+        # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
+        # plt.show()
+
+
+        (rotate_bda, scale_bda, flip_dx, flip_dy) = results['bev_pts_aug']
+        for index, adj in enumerate(results['adjacent']):
+            # filter bbox not in curr frame bbox
+            if 'relation2curr' in adj.keys():
+                sweeps_boxes_relation = adj['relation2curr']['curr_gt_boxes_relation']
+                sweeps_gt_bboxes = adj['relation2curr']['gt_boxes']
+                sweeps_gt_labels = adj['relation2curr']['gt_labels']
+                gt_bev_mask = results["adjacent_gt_bev_masks"][index].unsqueeze(0)
+                adjego2currego = results['adjego2currego'][index]
+
+                # sweeps_gt_bev_high = adj['gt_bev_high']
+
+                # sweep_keep_obj_id = set(gt_bbox_index) & set(sweeps_boxes_relation)
+                # filtered_gt_boxes = list()
+                # filtered_gt_labels = list()
+                # for i ,id in enumerate(sweeps_boxes_relation):
+                #     if id in sweep_keep_obj_id:
+                #         filtered_gt_boxes.(sweeps_gt_bboxes[i])
+                #         filtered_gt_labels.append(sweeps_gt_labels[i])
+
+                # sweep_keep_obj_id = set(gt_bbox_index) & set(sweeps_boxes_relation)
+                # keep_indices = np.isin(sweeps_boxes_relation, list(sweep_keep_obj_id))
+                # filtered_gt_boxes = sweeps_gt_bboxes[keep_indices]
+                # filtered_gt_labels = sweeps_gt_labels[keep_indices]
+
+                sweep_keep_obj_id = set(gt_bbox_index) & set(sweeps_boxes_relation)
+                keep_indices = np.where(np.isin(sweeps_boxes_relation,list(sweep_keep_obj_id)))
+                filtered_gt_boxes = [sweeps_gt_bboxes[i] for i in keep_indices[0]]
+                filtered_gt_labels = [sweeps_gt_labels[i] for i in keep_indices[0]]
+
+                # results['sweeps'][index]['curr_gt_boxes_relation'] = sweep_keep_obj_id
+                # results['sweeps'][index]['gt_bboxes'] = filtered_gt_bbox
+                # results['sweeps'][index]['gt_labels'] = filtered_gt_label
+
+                if len(filtered_gt_boxes) == 0:
+                    # print("len(filtered_gt_boxes: {}".format(len(filtered_gt_boxes)))
+                    continue
+                # pass
+                # # gt_boxes, gt_labels = results['ann_infos']
+                filtered_gt_boxes, filtered_gt_labels = torch.Tensor(np.array(filtered_gt_boxes)), torch.tensor(np.array(filtered_gt_labels))
+                filtered_gt_boxes, bda_rot = self.bev_transform(filtered_gt_boxes, rotate_bda, scale_bda, flip_dx, flip_dy)
+
+                rot_sin = (adjego2currego[0, 1]+adjego2currego[1,0])/2
+                rot_cos = (adjego2currego[0, 0]+adjego2currego[1,1])/2
+                angle = np.arctan2(rot_sin, rot_cos)
+                filtered_gt_boxes[:, 0:3] = filtered_gt_boxes[:, 0:3] @ adjego2currego[:3, :3]+adjego2currego[:3, 3]
+                filtered_gt_boxes[:, 6] -= angle
+                # rotate velo vector
+                filtered_gt_boxes[:, 7:9] = filtered_gt_boxes[:, 7:9] @ adjego2currego[:2, :2]
+
+                filtered_gt_boxes = LiDARInstance3DBoxes(filtered_gt_boxes, box_dim=filtered_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
+
+                # filtered_gt_boxes.rotate(bda_rot)
+
+                (corner_x6y6, x0y0, x0y1, corner_x8y8, corner_x0y0, x1y0, x1y1, corner_x2y2) = torch.split(
+                    filtered_gt_boxes.corners[..., :2], 1, dim=1)
+
+                #use 9 corner discript one object
+                # x0y0z0    x1y1z1    x2y2z2
+                # x3y3z3    x4y4z4    x5y5z5
+                # x6y6z6    x7y7z7    x8y8z8
+                corner_x1y1 = (corner_x0y0+corner_x2y2)/2
+                corner_x3y3 = (corner_x0y0+corner_x6y6)/2
+                corner_x7y7 = (corner_x8y8+corner_x6y6)/2
+                corner_x5y5 = (corner_x8y8+corner_x2y2)/2
+                corner_x4y4 = (corner_x3y3+corner_x5y5)/2
+
+                corner_points = torch.cat(
+                    [corner_x0y0, corner_x1y1, corner_x2y2, corner_x3y3, corner_x4y4, corner_x5y5,
+                     corner_x6y6, corner_x7y7, corner_x8y8], dim=1)
+                # corner_points = corner_points.reshape(N*C,D)
+
+                # grid_mask = torch.zeros(
+                #     int(self.grid_size[1] * self.grid_size[0]), device=corner_points.device, dtype=torch.float)
+                # grid_mask = grid_mask.reshape(int(self.grid_size[0]), int(self.grid_size[1]),int(self.grid_size[2]))
+                # grid_mask = torch.expand(int(self.grid_size[0]), int(self.grid_size[1]),)
+                corner_points_coors = ((corner_points - self.grid_lower_bound[:2].to(corner_points.device)) /
+                        self.grid_interval[:2].to(corner_points.device))
+
+                valid_corner_mask = ((corner_points_coors[:, :, 0] < 0) |
+                                     (corner_points_coors[:, :, 0] >= self.grid_size[0]) |
+                                     (corner_points_coors[:, :, 1] < 0) |
+                                     (corner_points_coors[:, :, 1] >= self.grid_size[1]))
+                valid_corner_mask = valid_corner_mask.unsqueeze(dim=-1).expand_as(corner_points_coors)
+
+                corner_points_coors[valid_corner_mask] = 0
+
+                # sweep_keep_obj_id = set(gt_bbox_index) & set(sweeps_boxes_relation)
+                keep_indices = np.where(np.isin(gt_bbox_index, list(sweep_keep_obj_id)))
+                keep_indices = np.array(keep_indices).squeeze()
+                curr_corner_tensor[keep_indices, :, 2*(1+index):2*(2+index)] = corner_points_coors
+
+                if self.lidar_guided:
+                    mask = torch.tensor(
+                        [gt_bev_mask[..., corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] for i in
+                         range(corner_points_coors.shape[0]) for j in range(corner_points_coors.shape[1])], dtype=torch.float32)
+                    mask = mask.reshape(corner_points_coors.shape[0], corner_points_coors.shape[1], 1)
+                    # corner_points_coors = torch.cat((corner_points_coors[..., :2], mask), dim=-1).long()
+                    # nonzero_idx = torch.nonzero(curr_corner_coor_t[:,:,-1])
+
+                    for i, obj_mask in enumerate(mask):
+                        row_indices, col_indices = torch.where(obj_mask == 1)
+                        curr_corner_mask[i, index+1, row_indices, row_indices[:, None]] = 1
+
+                # plt.imshow(gt_bev_mask.squeeze(0).numpy(), cmap='binary')
+                # plt.show()
+                # # gt_bev_mask_b = torch.zeros_like(gt_bev_mask)
+                # gt_bev_mask_b = gt_bev_mask.clone()
+                # for i in range(corner_points_coors.shape[0]):
+                #     for j in range(corner_points_coors.shape[1]):
+                #         if curr_corner_mask[i, index+1, j, 0] == 0:
+                #             gt_bev_mask_b[:, corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] = 2
+                #         elif curr_corner_mask[i, index+1, j, 0] == 1:
+                #             gt_bev_mask_b[:, corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] = 3
+                # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
+                # plt.show()
+
+        results['corner_relation'] = curr_corner_tensor
+        results['corner_mask'] = curr_corner_mask
+
+        return results
+

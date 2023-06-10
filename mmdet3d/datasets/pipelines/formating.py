@@ -73,6 +73,18 @@ class DefaultFormatBundle(object):
             results['gt_semantic_seg'] = DC(
                 to_tensor(results['gt_semantic_seg'][None, ...]), stack=True)
 
+        if 'corner_relation' in results:
+            results['corner_relation'] = DC(results['corner_relation'], cpu_only=False)
+
+        if 'corner_mask' in results:
+            results['corner_mask'] = DC(results['corner_mask'], cpu_only=False)
+
+        if 'sweeps_gt_boxes' in results:
+            results['sweeps_gt_boxes'] = DC(results['sweeps_gt_boxes'], cpu_only=True)
+
+        if 'sweeps_gt_labels' in results:
+            results['sweeps_gt_labels'] = DC(results['sweeps_gt_labels'], cpu_only=False)
+
         return results
 
     def __repr__(self):

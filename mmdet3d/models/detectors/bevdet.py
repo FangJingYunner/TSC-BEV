@@ -7,7 +7,8 @@ from mmdet3d.ops.bev_pool_v2.bev_pool import TRTBEVPoolv2
 from mmdet.models import DETECTORS
 from .. import builder
 from .centerpoint import CenterPoint
-
+from ..decode_heads.decode_head import Base3DDecodeHead
+import math
 
 @DETECTORS.register_module()
 class BEVDet(CenterPoint):
@@ -60,9 +61,9 @@ class BEVDet(CenterPoint):
 
     def extract_feat(self, points, img, img_metas, **kwargs):
         """Extract features from images and points."""
-        img_feats, depth = self.extract_img_feat(img, img_metas, **kwargs)
+        img_feats, depth, bev_feat_list = self.extract_img_feat(img, img_metas, **kwargs)
         pts_feats = None
-        return (img_feats, pts_feats, depth)
+        return (img_feats, pts_feats, depth, bev_feat_list)
 
     def forward_train(self,
                       points=None,
@@ -158,7 +159,7 @@ class BEVDet(CenterPoint):
                     rescale=False,
                     **kwargs):
         """Test function without augmentaiton."""
-        img_feats, _, _ = self.extract_feat(
+        img_feats, _, _, _ = self.extract_feat(
             points, img=img, img_metas=img_metas, **kwargs)
         bbox_list = [dict() for _ in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
@@ -332,10 +333,10 @@ class BEVDet4D(BEVDet):
         return output
 
     def prepare_bev_feat(self, img, rot, tran, intrin, post_rot, post_tran,
-                         bda, mlp_input):
+                         bda, mlp_input, gt_depth):
         x = self.image_encoder(img)
         bev_feat, depth = self.img_view_transformer(
-            [x, rot, tran, intrin, post_rot, post_tran, bda, mlp_input])
+            [x, rot, tran, intrin, post_rot, post_tran, bda, mlp_input, gt_depth])
         if self.pre_process:
             bev_feat = self.pre_process_net(bev_feat)[0]
         return bev_feat, depth
@@ -408,7 +409,7 @@ class BEVDet4D(BEVDet):
                 mlp_input = self.img_view_transformer.get_mlp_input(
                     rots[0], trans[0], intrin, post_rot, post_tran, bda)
                 inputs_curr = (img, rot, tran, intrin, post_rot,
-                               post_tran, bda, mlp_input)
+                               post_tran, bda, mlp_input, kwargs['gt_depth'])#rot,tran是从sweepsensor2keyego
                 if key_frame:
                     bev_feat, depth = self.prepare_bev_feat(*inputs_curr)
                 else:
@@ -441,8 +442,9 @@ class BEVDet4D(BEVDet):
                                        [rots[0], rots[adj_id]],
                                        bda)
         bev_feat = torch.cat(bev_feat_list, dim=1)
+
         x = self.bev_encoder(bev_feat)
-        return [x], depth_list[0]
+        return [x], depth_list[0], bev_feat_list
 
 
 @DETECTORS.register_module()
@@ -484,7 +486,7 @@ class BEVDepth4D(BEVDet4D):
         Returns:
             dict: Losses of different branches.
         """
-        img_feats, pts_feats, depth = self.extract_feat(
+        img_feats, pts_feats, depth, bev_feats_list = self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
         gt_depth = kwargs['gt_depth']
         loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
@@ -493,4 +495,510 @@ class BEVDepth4D(BEVDet4D):
                                             gt_labels_3d, img_metas,
                                             gt_bboxes_ignore)
         losses.update(losses_pts)
+        return losses
+
+
+
+
+@DETECTORS.register_module()
+class BEVDepth4DHigh(BEVDet4D):
+
+    def __init__(self, bev_structure_reg_head=None, depth_loss_type="v1", **kwargs):
+        super(BEVDepth4DHigh, self).__init__(**kwargs)
+
+        self.depth_loss_type = depth_loss_type
+        # if bev_structure_reg_head is not None:
+        #     self.bev_structure_reg_head = builder.build_head(bev_structure_reg_head)
+        if self.train_cfg is not None and self.train_cfg['object_temporal_consistance_loss'] is not None:
+            self.temporal_consistance_weight = self.train_cfg['object_temporal_consistance_loss']['weight']
+            self.before_fusion = self.train_cfg['object_temporal_consistance_loss']['before_fusion']
+            self.lidar_guided = self.train_cfg['object_temporal_consistance_loss']['lidar_guided']
+            self.use_half_feature = self.train_cfg['object_temporal_consistance_loss']['use_half_feature']
+            self.bilinear_interpolate = self.train_cfg['object_temporal_consistance_loss']['bilinear_interpolate']
+
+        self.tcl_start_flag = False
+
+        # if auxiliary_pts_bbox_head:
+        #     pts_train_cfg = kwargs["train_cfg"].pts if kwargs["train_cfg"] else None
+        #     auxiliary_pts_bbox_head.update(train_cfg=pts_train_cfg)
+        #     pts_test_cfg = kwargs["test_cfg"].pts if kwargs["test_cfg"] else None
+        #     auxiliary_pts_bbox_head.update(test_cfg=pts_test_cfg)
+        #     self.auxiliary_pts_bbox_head = builder.build_head(auxiliary_pts_bbox_head)
+
+
+    def temporal_consistance_loss(self, img_feats, bev_feats_list, corner_relation_list, corner_mask_list):
+    # def temporal_consistance_loss(self, img_feats, bev_feats_list, corner_relation_list):
+
+        bev_feats_list = list(map(list, zip(*bev_feats_list)))
+        # total_cos_loss = torch.zeros()
+        total_cos_loss = img_feats.new_zeros(9, 9)
+        batchsize = len(bev_feats_list)
+        # if self.before_fusion:
+        #     for batch in range(len(corner_relation_list)):
+        #         corner_relation_list[batch] = corner_relation_list[batch][:,:,2:]
+
+        # corner_relation = torch.split(corner_relation[0], 2, dim=2)
+        for bev_feat, prev_bev_feat_list,corner_relation, corner_mask in zip(img_feats, bev_feats_list, corner_relation_list, corner_mask_list):
+        # for bev_feat, prev_bev_feat_list,corner_relation in zip(img_feats, bev_feats_list, corner_relation_list):
+
+
+            # 判断历史帧是否用到
+            prev_bev_feat_use = torch.zeros(len(prev_bev_feat_list))
+            for prev_frame_id, prev_bev_feat in enumerate(prev_bev_feat_list):
+                if prev_bev_feat.max() == 0:
+                    prev_bev_feat_use[prev_frame_id] = 0
+                else:
+                    prev_bev_feat_use[prev_frame_id] = 1
+
+            if self.bilinear_interpolate:
+                bev_feat = bev_feat.unsqueeze(0)
+                _, C, H, W = bev_feat.shape
+
+            for bbox_corner_relation, bbox_corner_mask in zip(corner_relation, corner_mask):
+            # for bbox_corner_relation in corner_relation:
+
+                curr_corner_relation = bbox_corner_relation[:, :2]
+                if curr_corner_relation.min() <= 0:
+                    continue
+                if self.bilinear_interpolate:
+                    curr_corner_relation = curr_corner_relation.unsqueeze(0).unsqueeze(0)
+                    curr_corner_relation_norm = (2 * curr_corner_relation / W) - 1
+                    bilinear_current_feat = F.grid_sample(bev_feat,curr_corner_relation_norm,mode='bilinear')
+                    bilinear_current_feat = bilinear_current_feat.squeeze(2).squeeze(0)
+                    if self.before_fusion == False and self.use_half_feature == True:
+                        bilinear_current_feat = bilinear_current_feat[:int(C/2),:]
+
+                    curr_norm_tensor = torch.norm(bilinear_current_feat, dim=0)
+                    curr_box_cos_sim = torch.mm(bilinear_current_feat.t(), bilinear_current_feat) / torch.mm(
+                        curr_norm_tensor.unsqueeze(1), curr_norm_tensor.unsqueeze(0))
+                else:
+                    if self.before_fusion ==False and self.use_half_feature == True:
+                        C,_,_ = bev_feat.shape
+                        curr_feat_tensor = bev_feat[:int(C/2), curr_corner_relation[:, 0].long(), curr_corner_relation[:, 1].long()]
+                        curr_norm_tensor = torch.norm(curr_feat_tensor, dim=0)
+                    else:
+                        curr_feat_tensor = bev_feat[:, curr_corner_relation[:, 0].long(), curr_corner_relation[:, 1].long()]
+                        curr_norm_tensor = torch.norm(curr_feat_tensor, dim=0)
+
+                    curr_box_cos_sim = torch.mm(curr_feat_tensor.t(), curr_feat_tensor) / torch.mm(
+                        curr_norm_tensor.unsqueeze(1), curr_norm_tensor.unsqueeze(0))
+
+
+
+                box_total_cos_loss_sum = img_feats[0].new_zeros(9, 9)
+                if self.lidar_guided:
+                    box_frame_count = img_feats.new_zeros(9, 9)
+                else:
+                    box_frame_count = 0
+
+                prev_bbox_corners_list = torch.split(bbox_corner_relation, 2, dim=1)
+                prev_bbox_corner_mask_list = torch.split(bbox_corner_mask, 1, dim=0)
+
+                for prev_frame_id, (prev_bbox_corner, prev_bbox_corner_mask) in enumerate(zip(prev_bbox_corners_list, prev_bbox_corner_mask_list)):
+                # for prev_frame_id, prev_bbox_corner in enumerate(prev_bbox_corners_list):
+
+                    # 历史帧中没有该障碍物 or 障碍物出界了
+                    if prev_bbox_corner.max() == 0 or prev_bbox_corner.min() == -1:
+                        continue
+
+                    # 当前历史帧没用到，当前帧之前的历史帧也没用到
+                    if prev_bev_feat_use[prev_frame_id] == 0:
+                        break
+
+                    if self.bilinear_interpolate:
+                        prev_bbox_corner = prev_bbox_corner.unsqueeze(0).unsqueeze(0)
+                        prev_bev_feat = prev_bev_feat_list[prev_frame_id].unsqueeze(0)
+                        _,C,H,W = prev_bev_feat.shape
+                        prev_bbox_corner_norm = (2 * prev_bbox_corner / W) - 1
+                        bilinear_prev_feat = F.grid_sample(bev_feat,prev_bbox_corner_norm,mode='bilinear')
+                        bilinear_prev_feat = bilinear_prev_feat.squeeze(2).squeeze(0)
+                        if self.before_fusion == False and self.use_half_feature == True:
+                            bilinear_prev_feat = bilinear_prev_feat[:int(C/2),:]
+
+                        prev_norm_tensor = torch.norm(bilinear_prev_feat, dim=0)
+                        prev_box_cos_sim = torch.mm(bilinear_prev_feat.t(), bilinear_prev_feat) / torch.mm(
+                            prev_norm_tensor.unsqueeze(1), prev_norm_tensor.unsqueeze(0))
+                    else:
+
+                        prev_feat_tensor = prev_bev_feat_list[prev_frame_id][:, prev_bbox_corner[:, 0].long(), prev_bbox_corner[:, 1].long()]
+
+                        prev_norm_tensor = torch.norm(prev_feat_tensor, dim=0)
+
+                        prev_box_cos_sim = torch.mm(prev_feat_tensor.t(), prev_feat_tensor) / torch.mm(
+                            prev_norm_tensor.unsqueeze(1), prev_norm_tensor.unsqueeze(0))
+
+                    if self.lidar_guided:
+                        box_total_cos_loss_sum += prev_bbox_corner_mask.squeeze(0) * abs(curr_box_cos_sim-prev_box_cos_sim)
+                        box_frame_count += prev_bbox_corner_mask.squeeze(0)
+                    else:
+                        box_total_cos_loss_sum += abs(curr_box_cos_sim-prev_box_cos_sim)
+                        box_frame_count += 1
+
+                if self.lidar_guided:
+                    if box_frame_count.max() > 0:
+                            total_cos_loss += box_total_cos_loss_sum/(box_frame_count+1e-6)
+                else:
+                    if box_frame_count > 0:
+                        total_cos_loss += box_total_cos_loss_sum / box_frame_count
+
+        total_cos_loss_sum = self.temporal_consistance_weight*(torch.sum(total_cos_loss)/81/batchsize)
+
+        return {'box_cos_sim_loss': total_cos_loss_sum}
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      gt_bev_high=None,
+                      **kwargs):
+        """Forward training function.
+
+        Args:
+            points (list[torch.Tensor], optional): Points of each sample.
+                Defaults to None.
+            img_metas (list[dict], optional): Meta information of each sample.
+                Defaults to None.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`], optional):
+                Ground truth 3D boxes. Defaults to None.
+            gt_labels_3d (list[torch.Tensor], optional): Ground truth labels
+                of 3D boxes. Defaults to None.
+            gt_labels (list[torch.Tensor], optional): Ground truth labels
+                of 2D boxes in images. Defaults to None.
+            gt_bboxes (list[torch.Tensor], optional): Ground truth 2D boxes in
+                images. Defaults to None.
+            img (torch.Tensor optional): Images of each sample with shape
+                (N, C, H, W). Defaults to None.
+            proposals ([list[torch.Tensor], optional): Predicted proposals
+                used for training Fast RCNN. Defaults to None.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                2D boxes in images to be ignored. Defaults to None.
+
+        Returns:
+            dict: Losses of different branches.
+        """
+
+        img_feats, pts_feats, depth, bev_feats_list = self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+
+        if self.depth_loss_type == "v1":
+            gt_depth = kwargs['gt_depth']
+            loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
+            losses = dict(loss_depth=loss_depth)
+        elif self.depth_loss_type == "v2":
+            gt_depth = kwargs['gt_depth']
+            loss_depth = self.img_view_transformer.get_depth_loss_v2(gt_depth, depth)
+            losses = dict(loss_depth=loss_depth)
+        elif self.depth_loss_type == "none":
+            losses = dict()
+
+        # losses = dict()
+
+        # if hasattr(self, 'bev_structure_reg_head'):
+        #     bev_high_feature, bev_high_loss = self.bev_structure_reg_head(bev_feats_list, gt_bev_high)
+        #     losses.update(bev_high_loss)
+        #     img_feats[0] = torch.cat([img_feats[0], bev_high_feature], dim=1)
+        #
+        if self.tcl_start_flag:
+            corner_relation = kwargs['corner_relation']
+            corner_mask = kwargs['corner_mask']
+
+            if self.before_fusion:
+                temporal_consistance_loss = self.temporal_consistance_loss(bev_feats_list[0], bev_feats_list, corner_relation,corner_mask)
+                # temporal_consistance_loss = self.temporal_consistance_loss(bev_feats_list[0], bev_feats_list, corner_relation)
+
+            else:
+                temporal_consistance_loss = self.temporal_consistance_loss(img_feats[0], bev_feats_list, corner_relation,corner_mask)
+                # temporal_consistance_loss = self.temporal_consistance_loss(img_feats[0], bev_feats_list, corner_relation)
+
+            losses.update(temporal_consistance_loss)
+        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+        losses.update(losses_pts)
+        return losses
+
+@DETECTORS.register_module()
+class BEVDepthTCAuxiliary(BEVDet4D):
+
+    def __init__(self, bev_structure_reg_head=None, auxiliary_pts_bbox_head=None, depth_loss_type="v1", **kwargs):
+        super(BEVDepthTCAuxiliary, self).__init__(**kwargs)
+
+        self.depth_loss_type = depth_loss_type
+        # if bev_structure_reg_head is not None:
+        #     self.bev_structure_reg_head = builder.build_head(bev_structure_reg_head)
+        if self.train_cfg is not None and self.train_cfg['object_temporal_consistance_loss'] is not None:
+            self.temporal_consistance_weight = self.train_cfg['object_temporal_consistance_loss']['weight']
+            self.before_fusion = self.train_cfg['object_temporal_consistance_loss']['before_fusion']
+            self.lidar_guided = self.train_cfg['object_temporal_consistance_loss']['lidar_guided']
+            self.use_half_feature = self.train_cfg['object_temporal_consistance_loss']['use_half_feature']
+            self.bilinear_interpolate = self.train_cfg['object_temporal_consistance_loss']['bilinear_interpolate']
+
+        self.tcl_start_flag = False
+
+        if auxiliary_pts_bbox_head:
+            pts_train_cfg = kwargs["train_cfg"].pts if kwargs["train_cfg"] else None
+            auxiliary_pts_bbox_head.update(train_cfg=pts_train_cfg)
+            pts_test_cfg = kwargs["test_cfg"].pts if kwargs["test_cfg"] else None
+            auxiliary_pts_bbox_head.update(test_cfg=pts_test_cfg)
+            self.auxiliary_pts_bbox_head = builder.build_head(auxiliary_pts_bbox_head)
+            # self.auxiliary_weight = kwargs["train_cfg"].auxiliary_weight if kwargs["train_cfg"].auxiliary_weight else 0.125
+
+    def sweeps_forward_pts_train(self,
+                          pts_feats,
+                          gt_bboxes_3d,
+                          gt_labels_3d,
+                          img_metas,
+                          gt_bboxes_ignore=None):
+        """Forward function for point cloud branch.
+
+        Args:
+            pts_feats (list[torch.Tensor]): Features of point cloud branch
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth
+                boxes for each sample.
+            gt_labels_3d (list[torch.Tensor]): Ground truth labels for
+                boxes of each sampole
+            img_metas (list[dict]): Meta information of samples.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                boxes to be ignored. Defaults to None.
+
+        Returns:
+            dict: Losses of each branch.
+        """
+        outs = self.auxiliary_pts_bbox_head(pts_feats)
+        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        losses = self.auxiliary_pts_bbox_head.loss(*loss_inputs)
+        return losses
+
+
+    def temporal_consistance_loss(self, img_feats, bev_feats_list, corner_relation_list, corner_mask_list):
+    # def temporal_consistance_loss(self, img_feats, bev_feats_list, corner_relation_list):
+
+        bev_feats_list = list(map(list, zip(*bev_feats_list)))
+        # total_cos_loss = torch.zeros()
+        total_cos_loss = img_feats.new_zeros(9, 9)
+        batchsize = len(bev_feats_list)
+        # if self.before_fusion:
+        #     for batch in range(len(corner_relation_list)):
+        #         corner_relation_list[batch] = corner_relation_list[batch][:,:,2:]
+
+        # corner_relation = torch.split(corner_relation[0], 2, dim=2)
+        for bev_feat, prev_bev_feat_list,corner_relation, corner_mask in zip(img_feats, bev_feats_list, corner_relation_list, corner_mask_list):
+        # for bev_feat, prev_bev_feat_list,corner_relation in zip(img_feats, bev_feats_list, corner_relation_list):
+
+
+            # 判断历史帧是否用到
+            prev_bev_feat_use = torch.zeros(len(prev_bev_feat_list))
+            for prev_frame_id, prev_bev_feat in enumerate(prev_bev_feat_list):
+                if prev_bev_feat.max() == 0:
+                    prev_bev_feat_use[prev_frame_id] = 0
+                else:
+                    prev_bev_feat_use[prev_frame_id] = 1
+
+            if self.bilinear_interpolate:
+                bev_feat = bev_feat.unsqueeze(0)
+                _, C, H, W = bev_feat.shape
+
+            for bbox_corner_relation, bbox_corner_mask in zip(corner_relation, corner_mask):
+            # for bbox_corner_relation in corner_relation:
+
+                curr_corner_relation = bbox_corner_relation[:, :2]
+                if curr_corner_relation.min() <= 0:
+                    continue
+                if self.bilinear_interpolate:
+                    curr_corner_relation = curr_corner_relation.unsqueeze(0).unsqueeze(0)
+                    curr_corner_relation_norm = (2 * curr_corner_relation / W) - 1
+                    bilinear_current_feat = F.grid_sample(bev_feat,curr_corner_relation_norm,mode='bilinear')
+                    bilinear_current_feat = bilinear_current_feat.squeeze(2).squeeze(0)
+                    if self.before_fusion == False and self.use_half_feature == True:
+                        bilinear_current_feat = bilinear_current_feat[:int(C/2),:]
+
+                    curr_norm_tensor = torch.norm(bilinear_current_feat, dim=0)
+                    curr_box_cos_sim = torch.mm(bilinear_current_feat.t(), bilinear_current_feat) / torch.mm(
+                        curr_norm_tensor.unsqueeze(1), curr_norm_tensor.unsqueeze(0))
+                else:
+                    if self.before_fusion ==False and self.use_half_feature == True:
+                        C,_,_ = bev_feat.shape
+                        curr_feat_tensor = bev_feat[:int(C/2), curr_corner_relation[:, 0].long(), curr_corner_relation[:, 1].long()]
+                        curr_norm_tensor = torch.norm(curr_feat_tensor, dim=0)
+                    else:
+                        curr_feat_tensor = bev_feat[:, curr_corner_relation[:, 0].long(), curr_corner_relation[:, 1].long()]
+                        curr_norm_tensor = torch.norm(curr_feat_tensor, dim=0)
+
+                    curr_box_cos_sim = torch.mm(curr_feat_tensor.t(), curr_feat_tensor) / torch.mm(
+                        curr_norm_tensor.unsqueeze(1), curr_norm_tensor.unsqueeze(0))
+
+
+
+                box_total_cos_loss_sum = img_feats[0].new_zeros(9, 9)
+                if self.lidar_guided:
+                    box_frame_count = img_feats.new_zeros(9, 9)
+                else:
+                    box_frame_count = 0
+
+                prev_bbox_corners_list = torch.split(bbox_corner_relation, 2, dim=1)
+                prev_bbox_corner_mask_list = torch.split(bbox_corner_mask, 1, dim=0)
+
+                for prev_frame_id, (prev_bbox_corner, prev_bbox_corner_mask) in enumerate(zip(prev_bbox_corners_list, prev_bbox_corner_mask_list)):
+                # for prev_frame_id, prev_bbox_corner in enumerate(prev_bbox_corners_list):
+
+                    # 历史帧中没有该障碍物 or 障碍物出界了
+                    if prev_bbox_corner.max() == 0 or prev_bbox_corner.min() == -1:
+                        continue
+
+                    # 当前历史帧没用到，当前帧之前的历史帧也没用到
+                    if prev_bev_feat_use[prev_frame_id] == 0:
+                        break
+
+                    if self.bilinear_interpolate:
+                        prev_bbox_corner = prev_bbox_corner.unsqueeze(0).unsqueeze(0)
+                        prev_bev_feat = prev_bev_feat_list[prev_frame_id].unsqueeze(0)
+                        _,C,H,W = prev_bev_feat.shape
+                        prev_bbox_corner_norm = (2 * prev_bbox_corner / W) - 1
+                        bilinear_prev_feat = F.grid_sample(bev_feat,prev_bbox_corner_norm,mode='bilinear')
+                        bilinear_prev_feat = bilinear_prev_feat.squeeze(2).squeeze(0)
+                        if self.before_fusion == False and self.use_half_feature == True:
+                            bilinear_prev_feat = bilinear_prev_feat[:int(C/2),:]
+
+                        prev_norm_tensor = torch.norm(bilinear_prev_feat, dim=0)
+                        prev_box_cos_sim = torch.mm(bilinear_prev_feat.t(), bilinear_prev_feat) / torch.mm(
+                            prev_norm_tensor.unsqueeze(1), prev_norm_tensor.unsqueeze(0))
+                    else:
+
+                        prev_feat_tensor = prev_bev_feat_list[prev_frame_id][:, prev_bbox_corner[:, 0].long(), prev_bbox_corner[:, 1].long()]
+
+                        prev_norm_tensor = torch.norm(prev_feat_tensor, dim=0)
+
+                        prev_box_cos_sim = torch.mm(prev_feat_tensor.t(), prev_feat_tensor) / torch.mm(
+                            prev_norm_tensor.unsqueeze(1), prev_norm_tensor.unsqueeze(0))
+
+                    if self.lidar_guided:
+                        box_total_cos_loss_sum += prev_bbox_corner_mask.squeeze(0) * abs(curr_box_cos_sim-prev_box_cos_sim)
+                        box_frame_count += prev_bbox_corner_mask.squeeze(0)
+                    else:
+                        box_total_cos_loss_sum += abs(curr_box_cos_sim-prev_box_cos_sim)
+                        box_frame_count += 1
+
+                if self.lidar_guided:
+                    if box_frame_count.max() > 0:
+                            total_cos_loss += box_total_cos_loss_sum/(box_frame_count+1e-6)
+                else:
+                    if box_frame_count > 0:
+                        total_cos_loss += box_total_cos_loss_sum / box_frame_count
+
+        total_cos_loss_sum = self.temporal_consistance_weight*(torch.sum(total_cos_loss)/81/batchsize)
+
+        return {'box_cos_sim_loss': total_cos_loss_sum}
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      gt_bev_high=None,
+                      **kwargs):
+        """Forward training function.
+
+        Args:
+            points (list[torch.Tensor], optional): Points of each sample.
+                Defaults to None.
+            img_metas (list[dict], optional): Meta information of each sample.
+                Defaults to None.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`], optional):
+                Ground truth 3D boxes. Defaults to None.
+            gt_labels_3d (list[torch.Tensor], optional): Ground truth labels
+                of 3D boxes. Defaults to None.
+            gt_labels (list[torch.Tensor], optional): Ground truth labels
+                of 2D boxes in images. Defaults to None.
+            gt_bboxes (list[torch.Tensor], optional): Ground truth 2D boxes in
+                images. Defaults to None.
+            img (torch.Tensor optional): Images of each sample with shape
+                (N, C, H, W). Defaults to None.
+            proposals ([list[torch.Tensor], optional): Predicted proposals
+                used for training Fast RCNN. Defaults to None.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                2D boxes in images to be ignored. Defaults to None.
+
+        Returns:
+            dict: Losses of different branches.
+        """
+
+        img_feats, pts_feats, depth, bev_feats_list = self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+
+        if self.depth_loss_type == "v1":
+            gt_depth = kwargs['gt_depth']
+            loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
+            losses = dict(loss_depth=loss_depth)
+        elif self.depth_loss_type == "v2":
+            gt_depth = kwargs['gt_depth']
+            loss_depth = self.img_view_transformer.get_depth_loss_v2(gt_depth, depth)
+            losses = dict(loss_depth=loss_depth)
+        elif self.depth_loss_type == "none":
+            losses = dict()
+
+        # losses = dict()
+
+        # if hasattr(self, 'bev_structure_reg_head'):
+        #     bev_high_feature, bev_high_loss = self.bev_structure_reg_head(bev_feats_list, gt_bev_high)
+        #     losses.update(bev_high_loss)
+        #     img_feats[0] = torch.cat([img_feats[0], bev_high_feature], dim=1)
+        #
+        if self.tcl_start_flag:
+            corner_relation = kwargs['corner_relation']
+            corner_mask = kwargs['corner_mask']
+
+            if self.before_fusion:
+                temporal_consistance_loss = self.temporal_consistance_loss(bev_feats_list[0], bev_feats_list, corner_relation,corner_mask)
+                # temporal_consistance_loss = self.temporal_consistance_loss(bev_feats_list[0], bev_feats_list, corner_relation)
+
+            else:
+                temporal_consistance_loss = self.temporal_consistance_loss(img_feats[0], bev_feats_list, corner_relation,corner_mask)
+                # temporal_consistance_loss = self.temporal_consistance_loss(img_feats[0], bev_feats_list, corner_relation)
+
+            losses.update(temporal_consistance_loss)
+        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+        losses.update(losses_pts)
+
+
+        if self.with_prev:
+            sweeps_gt_boxes = kwargs["sweeps_gt_boxes"]
+            sweeps_gt_labels = kwargs["sweeps_gt_labels"]
+            sweeps_gt_boxes = list(map(list,zip(*sweeps_gt_boxes)))
+            sweeps_gt_labels = list(map(list,zip(*sweeps_gt_labels)))
+
+            prev_losses = dict()
+            for i in range(len(sweeps_gt_boxes)):
+                prev_feat_input = list()
+                prev_feat_input.append(bev_feats_list[i+1])
+                sweep_losses_pts = self.sweeps_forward_pts_train(prev_feat_input, sweeps_gt_boxes[i],
+                                                    sweeps_gt_labels[i], img_metas,
+                                                    gt_bboxes_ignore)
+                for (key,value) in sweep_losses_pts.items():
+                    key = key+"prev"
+                    if key in prev_losses.keys():
+                        prev_losses[key] = prev_losses[key]
+                    else:
+                        prev_losses[key] = value
+
+            # for (key, value) in sweep_losses_pts.items():
+            #     prev_losses[key] = prev_losses[key]*self.auxiliary_weight
+
+            # sweep_losses_pts = self.sweeps_forward_pts_train(bev_feats_list[1:], sweeps_gt_boxes,
+            #                                     sweeps_gt_labels, img_metas,
+            #                                     gt_bboxes_ignore)
+            # for (key, value) in sweep_losses_pts.items():
+            #     prev_losses[key] = sweep_losses_pts[key]*self.auxiliary_weight
+            losses.update(prev_losses)
+
         return losses

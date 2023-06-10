@@ -60,7 +60,7 @@ def gaussian_radius(det_size, min_overlap=0.5):
     Args:
         det_size (tuple[torch.Tensor]): Size of the detection result.
         min_overlap (float, optional): Gaussian_overlap. Defaults to 0.5.
-
+        https://blog.csdn.net/x550262257/article/details/121289242
     Returns:
         torch.Tensor: Computed radius.
     """

@@ -199,17 +199,23 @@ class LSSViewTransformer(BaseModule):
         B, N, D, H, W, _ = coor.shape
         num_points = B * N * D * H * W
         # record the index of selected points for acceleration purpose
-        ranks_depth = torch.range(
-            0, num_points - 1, dtype=torch.int, device=coor.device)
-        ranks_feat = torch.range(
-            0, num_points // D - 1, dtype=torch.int, device=coor.device)
+        # ranks_depth = torch.range(
+        #     0, num_points - 1, dtype=torch.int, device=coor.device)
+        ranks_depth = torch.arange(
+            0, num_points, dtype=torch.int, device=coor.device)
+        # ranks_feat = torch.range(
+        #     0, num_points // D - 1, dtype=torch.int, device=coor.device)
+        ranks_feat = torch.arange(
+            0, num_points // D, dtype=torch.int, device=coor.device)
         ranks_feat = ranks_feat.reshape(B, N, 1, H, W)
         ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten()
         # convert coordinate into the voxel space
         coor = ((coor - self.grid_lower_bound.to(coor)) /
                 self.grid_interval.to(coor))
         coor = coor.long().view(num_points, 3)
-        batch_idx = torch.range(0, B - 1).reshape(B, 1). \
+        # batch_idx = torch.range(0, B - 1).reshape(B, 1). \
+        #     expand(B, num_points // B).reshape(num_points, 1).to(coor)
+        batch_idx = torch.arange(0, B).reshape(B, 1). \
             expand(B, num_points // B).reshape(num_points, 1).to(coor)
         coor = torch.cat((coor, batch_idx), 1)
 
@@ -267,7 +273,7 @@ class LSSViewTransformer(BaseModule):
 
             bev_feat = bev_feat.squeeze(2)
         else:
-            coor = self.get_lidar_coor(*input[1:7])
+            coor = self.get_lidar_coor(*input[1:7])#像素中的每个深度点对应ego坐标系中的coor的xyz点
             bev_feat = self.voxel_pooling_v2(
                 coor, depth.view(B, N, self.D, H, W),
                 tran_feat.view(B, N, self.out_channels, H, W))
@@ -641,6 +647,66 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
                                                                            1:]
         return gt_depths.float()
 
+
+    def get_downsampled_gt_depth_v2(self, gt_depths):
+        """
+        Input:
+            gt_depths: [B, N, H, W]
+        Output:
+            gt_depths: [B*N*h*w, d]
+        """
+        if isinstance(gt_depths,list):
+            #test模式传进来的是list
+            gt_depths = gt_depths[0]
+        B, N, H, W = gt_depths.shape
+        gt_depths = gt_depths.view(B * N, H // self.downsample,
+                                   self.downsample, W // self.downsample,
+                                   self.downsample, 1)
+        gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+        gt_depths = gt_depths.view(-1, self.downsample * self.downsample)
+        # gt_depths_tmp = torch.where(gt_depths == 0.0,
+        #                             1e5 * torch.ones_like(gt_depths),
+        #                             gt_depths)
+
+        # gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+        # gt_depths = gt_depths.view(B * N, H // self.downsample,
+        #                            W // self.downsample)
+
+        gt_depths = (
+                            gt_depths -
+                            (self.grid_config['depth'][0] -
+                             self.grid_config['depth'][2])) / self.grid_config['depth'][2]
+        gt_depths = torch.where((gt_depths < self.D + 1) & (gt_depths >= 0.0),
+                                gt_depths, torch.zeros_like(gt_depths))
+        S,_ = gt_depths.shape
+        gt_depths_loss = torch.zeros((gt_depths.shape[0],int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2])),device=gt_depths.device)
+
+        for index in range(S):
+            histogram = torch.histc(gt_depths[index, :], bins=int(
+                (self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]), min=self.grid_config['depth'][0],
+                                    max=(self.grid_config['depth'][1] - self.grid_config['depth'][0]) /
+                                        self.grid_config['depth'][2])
+
+            gt_depths_loss[index,:]=histogram
+        # gt_depths_train = F.one_hot(
+        #     gt_depths.long(), num_classes=self.D + 1)[..., 1:]
+        # gt_depths_train = gt_depths_train.permute(0, 3, 1, 2).contiguous()
+        mask = gt_depths_loss != 0
+
+        # 将零元素替换为一个很小的数，避免在 softmax 运算中影响其他非零元素
+        gt_depths_loss = torch.where(mask, gt_depths_loss, torch.tensor(-1e9,device=gt_depths.device))
+        gt_depths_loss = torch.softmax(gt_depths_loss,dim=-1)
+        gt_depths_loss = torch.where(gt_depths_loss > 0.01,gt_depths_loss, torch.ones_like(gt_depths_loss)*1e-6)
+
+        # gt_depths_train = gt_depths_loss.view(B * N, H // self.downsample,
+        #                            W // self.downsample,int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]))
+        # gt_depths_train = gt_depths_train.permute(0,3,1,2)
+        # gt_depths_loss = F.one_hot(
+        #     gt_depths.long(), num_classes=self.D + 1).view(-1, self.D + 1)[:,
+        #                                                                    1:]
+
+        return gt_depths_loss.float()
+
     @force_fp32()
     def get_depth_loss(self, depth_labels, depth_preds):
         depth_labels = self.get_downsampled_gt_depth(depth_labels)
@@ -657,9 +723,26 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
             ).sum() / max(1.0, fg_mask.sum())
         return self.loss_depth_weight * depth_loss
 
+    def get_depth_loss_v2(self, depth_labels, depth_preds):
+        # _, depth_labels = self.get_downsampled_gt_depth(depth_labels)
+        depth_labels = self.get_downsampled_gt_depth_v2(depth_labels)
+
+        depth_preds = depth_preds.permute(0, 2, 3,
+                                          1).contiguous().view(-1, self.D)
+        fg_mask = torch.max(depth_labels, dim=1).values > 0.01
+        depth_labels = depth_labels[fg_mask]
+        depth_preds = depth_preds[fg_mask]
+        # with autocast(enabled=False):
+        #     depth_loss = F.l1_loss(
+        #         depth_labels,
+        #         depth_preds,
+        #         reduction='none',
+        #     ).sum() / max(1.0, fg_mask.sum())
+        depth_loss = torch.sum((depth_labels - depth_preds)**2)/ max(1.0, fg_mask.sum())
+        return self.loss_depth_weight * depth_loss
     def forward(self, input):
         (x, rots, trans, intrins, post_rots, post_trans, bda,
-         mlp_input) = input[:8]
+         mlp_input, gt_depth) = input[:9]
 
         B, N, C, H, W = x.shape
         x = x.view(B * N, C, H, W)
@@ -667,4 +750,254 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
         depth_digit = x[:, :self.D, ...]
         tran_feat = x[:, self.D:self.D + self.out_channels, ...]
         depth = depth_digit.softmax(dim=1)
+        return self.view_transform(input, depth, tran_feat)
+
+
+class ContextNet(nn.Module):
+
+    def __init__(self,
+                 in_channels,
+                 mid_channels,
+                 context_channels,
+                 depth_channels,
+                 use_dcn=True,
+                 use_aspp=True):
+        super(ContextNet, self).__init__()
+        self.reduce_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.context_conv = nn.Conv2d(
+            mid_channels, context_channels, kernel_size=1, stride=1, padding=0)
+        self.bn = nn.BatchNorm1d(27)
+        # self.depth_mlp = Mlp(27, mid_channels, mid_channels)
+        # self.depth_se = SELayer(mid_channels)  # NOTE: add camera-aware
+        self.context_mlp = Mlp(27, mid_channels, mid_channels)
+        self.context_se = SELayer(mid_channels)  # NOTE: add camera-aware
+        # depth_conv_list = [
+        #     BasicBlock(mid_channels, mid_channels),
+        #     BasicBlock(mid_channels, mid_channels),
+        #     BasicBlock(mid_channels, mid_channels),
+        # ]
+        # if use_aspp:
+        #     depth_conv_list.append(ASPP(mid_channels, mid_channels))
+        # if use_dcn:
+        #     depth_conv_list.append(
+        #         build_conv_layer(
+        #             cfg=dict(
+        #                 type='DCN',
+        #                 in_channels=mid_channels,
+        #                 out_channels=mid_channels,
+        #                 kernel_size=3,
+        #                 padding=1,
+        #                 groups=4,
+        #                 im2col_step=128,
+        #             )))
+        # depth_conv_list.append(
+        #     nn.Conv2d(
+        #         mid_channels,
+        #         depth_channels,
+        #         kernel_size=1,
+        #         stride=1,
+        #         padding=0))
+        # self.depth_conv = nn.Sequential(*depth_conv_list)
+
+    def forward(self, x, mlp_input):
+        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1]))
+        x = self.reduce_conv(x)
+        context_se = self.context_mlp(mlp_input)[..., None, None]
+        context = self.context_se(x, context_se)
+        context = self.context_conv(context)
+        # depth_se = self.depth_mlp(mlp_input)[..., None, None]
+        # depth = self.depth_se(x, depth_se)
+        # depth = self.depth_conv(depth)
+        # return torch.cat([depth, context], dim=1)
+
+        return context
+
+
+@NECKS.register_module()
+class LSSViewTransformerBEVDepthWithGT(LSSViewTransformer):
+
+    def __init__(self, loss_depth_weight=3.0, depthnet_cfg=dict(),depth_type="v2", **kwargs):
+        super(LSSViewTransformerBEVDepthWithGT, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+        self.context_net = ContextNet(self.in_channels, self.in_channels,
+                                  self.out_channels, self.D, **depthnet_cfg)
+        self.depth_type = depth_type
+
+    def get_mlp_input(self, rot, tran, intrin, post_rot, post_tran, bda):
+        B, N, _, _ = rot.shape
+        bda = bda.view(B, 1, 3, 3).repeat(1, N, 1, 1)
+        mlp_input = torch.stack([
+            intrin[:, :, 0, 0],
+            intrin[:, :, 1, 1],
+            intrin[:, :, 0, 2],
+            intrin[:, :, 1, 2],
+            post_rot[:, :, 0, 0],
+            post_rot[:, :, 0, 1],
+            post_tran[:, :, 0],
+            post_rot[:, :, 1, 0],
+            post_rot[:, :, 1, 1],
+            post_tran[:, :, 1],
+            bda[:, :, 0, 0],
+            bda[:, :, 0, 1],
+            bda[:, :, 1, 0],
+            bda[:, :, 1, 1],
+            bda[:, :, 2, 2],
+        ],
+            dim=-1)
+        sensor2ego = torch.cat([rot, tran.reshape(B, N, 3, 1)],
+                               dim=-1).reshape(B, N, -1)
+        mlp_input = torch.cat([mlp_input, sensor2ego], dim=-1)
+        return mlp_input
+
+    def get_downsampled_gt_depth(self, gt_depths):
+        """
+        Input:
+            gt_depths: [B, N, H, W]
+        Output:
+            gt_depths: [B*N*h*w, d]
+        """
+        if isinstance(gt_depths,list):
+            #test模式传进来的是list
+            gt_depths = gt_depths[0]
+        B, N, H, W = gt_depths.shape
+        gt_depths = gt_depths.view(B * N, H // self.downsample,
+                                   self.downsample, W // self.downsample,
+                                   self.downsample, 1)
+        gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+        gt_depths = gt_depths.view(-1, self.downsample * self.downsample)
+        gt_depths_tmp = torch.where(gt_depths == 0.0,
+                                    1e5 * torch.ones_like(gt_depths),
+                                    gt_depths)
+        gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+        gt_depths = gt_depths.view(B * N, H // self.downsample,
+                                   W // self.downsample)
+
+        gt_depths = (
+                            gt_depths -
+                            (self.grid_config['depth'][0] -
+                             self.grid_config['depth'][2])) / self.grid_config['depth'][2]
+        gt_depths = torch.where((gt_depths < self.D + 1) & (gt_depths >= 0.0),
+                                gt_depths, torch.zeros_like(gt_depths))
+        gt_depths_train = F.one_hot(
+            gt_depths.long(), num_classes=self.D + 1)[..., 1:]
+        gt_depths_train = gt_depths_train.permute(0, 3, 1, 2).contiguous()
+
+        gt_depths_loss = F.one_hot(
+            gt_depths.long(), num_classes=self.D + 1).view(-1, self.D + 1)[:,
+                                                                           1:]
+
+        return gt_depths_train.float(), gt_depths_loss.float()
+
+    def get_downsampled_gt_depth_v2(self, gt_depths):
+        """
+        Input:
+            gt_depths: [B, N, H, W]
+        Output:
+            gt_depths: [B*N*h*w, d]
+        """
+        if isinstance(gt_depths,list):
+            #test模式传进来的是list
+            gt_depths = gt_depths[0]
+        B, N, H, W = gt_depths.shape
+        gt_depths = gt_depths.view(B * N, H // self.downsample,
+                                   self.downsample, W // self.downsample,
+                                   self.downsample, 1)
+        gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+        gt_depths = gt_depths.view(-1, self.downsample * self.downsample)
+        # gt_depths_tmp = torch.where(gt_depths == 0.0,
+        #                             1e5 * torch.ones_like(gt_depths),
+        #                             gt_depths)
+
+        # gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+        # gt_depths = gt_depths.view(B * N, H // self.downsample,
+        #                            W // self.downsample)
+
+        gt_depths = (
+                            gt_depths -
+                            (self.grid_config['depth'][0] -
+                             self.grid_config['depth'][2])) / self.grid_config['depth'][2]
+        gt_depths = torch.where((gt_depths < self.D + 1) & (gt_depths >= 0.0),
+                                gt_depths, torch.zeros_like(gt_depths))
+        S,_ = gt_depths.shape
+        gt_depths_loss = torch.zeros((gt_depths.shape[0],int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2])),device=gt_depths.device)
+
+        for index in range(S):
+            histogram = torch.histc(gt_depths[index, :], bins=int(
+                (self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]), min=1,
+                                    max=(self.grid_config['depth'][1] - self.grid_config['depth'][0]) /
+                                        self.grid_config['depth'][2])
+
+            gt_depths_loss[index,:]=histogram
+        # gt_depths_train = F.one_hot(
+        #     gt_depths.long(), num_classes=self.D + 1)[..., 1:]
+        # gt_depths_train = gt_depths_train.permute(0, 3, 1, 2).contiguous()
+        mask = gt_depths_loss != 0
+
+        # 将零元素替换为一个很小的数，避免在 softmax 运算中影响其他非零元素
+        gt_depths_loss = torch.where(mask, gt_depths_loss, torch.tensor(-1e9,device=gt_depths.device))
+        gt_depths_loss = torch.softmax(gt_depths_loss,dim=-1)
+        gt_depths_loss = torch.where(gt_depths_loss > 0.01,gt_depths_loss, torch.zeros_like(gt_depths_loss))
+
+        gt_depths_train = gt_depths_loss.view(B * N, H // self.downsample,
+                                   W // self.downsample,int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]))
+        gt_depths_train = gt_depths_train.permute(0,3,1,2)
+        # gt_depths_loss = F.one_hot(
+        #     gt_depths.long(), num_classes=self.D + 1).view(-1, self.D + 1)[:,
+        #                                                                    1:]
+
+        return gt_depths_train.float(), gt_depths_loss.float()
+
+    @force_fp32()
+    def get_depth_loss(self, depth_labels, depth_preds):
+        # _, depth_labels = self.get_downsampled_gt_depth(depth_labels)
+        _, depth_labels = self.get_downsampled_gt_depth_v2(depth_labels)
+
+        depth_preds = depth_preds.permute(0, 2, 3,
+                                          1).contiguous().view(-1, self.D)
+        fg_mask = torch.max(depth_labels, dim=1).values > 0.01
+        depth_labels = depth_labels[fg_mask]
+        depth_preds = depth_preds[fg_mask]
+        with autocast(enabled=False):
+            depth_loss = F.binary_cross_entropy(
+                depth_preds,
+                depth_labels,
+                reduction='none',
+            ).sum() / max(1.0, fg_mask.sum())
+        return self.loss_depth_weight * depth_loss
+    def get_depth_loss_v2(self, depth_labels, depth_preds):
+        # _, depth_labels = self.get_downsampled_gt_depth(depth_labels)
+        _, depth_labels = self.get_downsampled_gt_depth_v2(depth_labels)
+
+        depth_preds = depth_preds.permute(0, 2, 3,
+                                          1).contiguous().view(-1, self.D)
+        fg_mask = torch.max(depth_labels, dim=1).values > 0.01
+        depth_labels = depth_labels[fg_mask]
+        depth_preds = depth_preds[fg_mask]
+        # with autocast(enabled=False):
+        #     depth_loss = F.l1_loss(
+        #         depth_labels,
+        #         depth_preds,
+        #         reduction='none',
+        #     ).sum() / max(1.0, fg_mask.sum())
+        depth_loss = torch.sum((depth_labels - depth_preds)**2)/ max(1.0, fg_mask.sum())
+        return self.loss_depth_weight * depth_loss
+    def forward(self, input):
+        (x, rots, trans, intrins, post_rots, post_trans, bda,
+         mlp_input, gt_depth) = input[:9]
+        if self.depth_type == "v1":
+            depth, _ = self.get_downsampled_gt_depth(gt_depth)
+        elif self.depth_type == "v2":
+            depth, _ = self.get_downsampled_gt_depth_v2(gt_depth)
+        depth = depth.detach()
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+        tran_feat = self.context_net(x, mlp_input)
+        # depth_digit = x[:, :self.D, ...]
+        # tran_feat = x[:, self.D:self.D + self.out_channels, ...]
+        # depth = depth_digit.softmax(dim=1)
         return self.view_transform(input, depth, tran_feat)

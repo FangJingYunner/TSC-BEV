@@ -27,6 +27,12 @@ data_config = {
     'flip': True,
     'crop_h': (0.0, 0.0),
     'resize_test': 0.00,
+
+    # 'resize': (-0.00, 0.0),
+    # 'rot': (-0, 0),
+    # 'flip': False,
+    # 'crop_h': (0.0, 0.0),
+    # 'resize_test': 0.00,
 }
 
 # Model
@@ -44,7 +50,8 @@ numC_Trans = 40
 multi_adj_frame_id_cfg = (1, 8+1, 1)
 
 model = dict(
-    type='BEVDepth4D',
+    depth_loss_type="v2",  # v1 original loss v2: 我修改的loss gt:深度估计没有监督
+    type='BEVDepthTCAuxiliary',
     align_after_view_transfromation=False,
     num_adj=len(range(*multi_adj_frame_id_cfg)),
     img_backbone=dict(
@@ -72,7 +79,17 @@ model = dict(
         in_channels=256,
         out_channels=numC_Trans,
         depthnet_cfg=dict(use_dcn=False),
-        downsample=16),
+        downsample=16,
+        loss_depth_weight=5),
+    # img_view_transformer=dict(
+    #     type='LSSViewTransformerBEVDepthWithGT',
+    #     grid_config=grid_config,
+    #     input_size=data_config['input_size'],
+    #     in_channels=256,
+    #     out_channels=numC_Trans,
+    #     depthnet_cfg=dict(use_dcn=False),
+    #     downsample=16,
+    #     depth_tpye = "v2"), # v1,v2
     img_bev_encoder_backbone=dict(
         type='CustomResNet',
         numC_input=numC_Trans * (len(range(*multi_adj_frame_id_cfg))+1),
@@ -88,9 +105,22 @@ model = dict(
         num_channels=[numC_Trans,],
         stride=[1,],
         backbone_output_ids=[0,]),
+    # bev_structure_reg_head=dict(
+    #     type='BEVStructureRegHead',
+    #     init_cfg = None,
+    #     bev_high_weight=0.1,
+    #     out_channel = 1,
+    #     use_mask = False),
+
+    # bev_temporal_consistance_loss=dict(
+    #     type='bev_temporal_consistance_loss',
+    #     init_cfg=None,
+    #     weight=0.5,
+    #     ),
+
     pts_bbox_head=dict(
         type='CenterHead',
-        in_channels=128,
+        in_channels=128, #concat bev_structure_reg_head
         tasks=[
             dict(num_class=1, class_names=['car']),
             dict(num_class=2, class_names=['truck', 'construction_vehicle']),
@@ -116,6 +146,36 @@ model = dict(
         loss_cls=dict(type='GaussianFocalLoss', reduction='mean'),
         loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25),
         norm_bbox=True),
+
+    auxiliary_pts_bbox_head=dict(
+            type='CenterHead',
+            in_channels=numC_Trans,  # concat bev_structure_reg_head
+            tasks=[
+                dict(num_class=1, class_names=['car']),
+                dict(num_class=2, class_names=['truck', 'construction_vehicle']),
+                dict(num_class=2, class_names=['bus', 'trailer']),
+                dict(num_class=1, class_names=['barrier']),
+                dict(num_class=2, class_names=['motorcycle', 'bicycle']),
+                dict(num_class=2, class_names=['pedestrian', 'traffic_cone']),
+            ],
+            common_heads=dict(
+                reg=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
+            share_conv_channel=64,
+            bbox_coder=dict(
+                type='CenterPointBBoxCoder',
+                pc_range=point_cloud_range[:2],
+                post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+                max_num=500,
+                score_threshold=0.1,
+                out_size_factor=8,
+                voxel_size=voxel_size[:2],
+                code_size=9),
+            separate_head=dict(
+                type='SeparateHead', init_bias=-2.19, final_kernel=3),
+            loss_cls=dict(type='GaussianFocalLoss', reduction='mean'),
+            loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.125),
+            norm_bbox=True),
+
     # model training and testing settings
     train_cfg=dict(
         pts=dict(
@@ -124,10 +184,12 @@ model = dict(
             voxel_size=voxel_size,
             out_size_factor=8,
             dense_reg=1,
-            gaussian_overlap=0.1,
+            gaussian_overlap=0.1, #这里的overlap感觉太小了，这个overlap越高表示要求3D框的iou越高
             max_objs=500,
             min_radius=2,
-            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),
+            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            # depth_loss="v1", #在LSSViewTransformerBEVDepthWithGT模块生效
+        object_temporal_consistance_loss=dict(weight=0.25, before_fusion=False,lidar_guided=False, use_half_feature=False,bilinear_interpolate=True)),
     test_cfg=dict(
         pts=dict(
             pc_range=point_cloud_range[:2],
@@ -161,6 +223,12 @@ bda_aug_conf = dict(
     flip_dx_ratio=0.5,
     flip_dy_ratio=0.5)
 
+# bda_aug_conf = dict(
+#     rot_lim=(-0, 0),
+#     scale_lim=(1, 1),
+#     flip_dx_ratio=0,
+#     flip_dy_ratio=0)
+
 train_pipeline = [
     dict(
         type='PrepareImageInputs',
@@ -172,18 +240,36 @@ train_pipeline = [
         bda_aug_conf=bda_aug_conf,
         classes=class_names),
     dict(
+        type='LoadSweepsAnnotationsBEVDepth',
+        bda_aug_conf=bda_aug_conf,
+        classes=class_names),
+    dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
         use_dim=5,
         file_client_args=file_client_args),
+    # dict(
+    #     type='LoadPointsFromMultiSweeps',
+    #     sweeps_num= 10,
+    #     load_dim=5,
+    #     use_dim=5,
+    #     file_client_args=file_client_args),
+
     dict(type='PointToMultiViewDepth', downsample=1, grid_config=grid_config),
+    dict(type='PointToGridStructure', grid_minpts=1, grid_config=grid_config, point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='BEVObjectCornerAnnotation', grid_config=grid_config, point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(
-        type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
-                                'gt_depth'])
+    dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+                                 'gt_depth', 'corner_relation', 'corner_mask', 'sweeps_gt_boxes', 'sweeps_gt_labels'])
+    # dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+    #                             'gt_depth', 'corner_relation','corner_mask'])
+    # dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+    #                              'gt_depth', 'corner_relation'])
+    # dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+    #                              'gt_depth'])
 ]
 
 test_pipeline = [
@@ -199,6 +285,7 @@ test_pipeline = [
         load_dim=5,
         use_dim=5,
         file_client_args=file_client_args),
+    dict(type='PointToMultiViewDepth', downsample=1, grid_config=grid_config),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -209,7 +296,7 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['points', 'img_inputs'])
+            dict(type='Collect3D', keys=['points', 'img_inputs', 'gt_depth'])
         ])
 ]
 
@@ -224,31 +311,32 @@ share_data_config = dict(
     type=dataset_type,
     classes=class_names,
     modality=input_modality,
-    img_info_prototype='bevdet4d',
+    img_info_prototype='bevdetTC',
     multi_adj_frame_id_cfg=multi_adj_frame_id_cfg,
 )
 
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file=data_root + 'bevdetv2-nuscenes-mini_infos_val.pkl')
+    ann_file=data_root + 'bevdetv2-nuscenes-TC2_infos_val.pkl')
 
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=16,
     workers_per_gpu=8,
-    pin_memory=True,
-    persistent_workers=False,
+    pin_memory=False,
+    persistent_workers=True,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes-mini_infos_train.pkl',
+        ann_file=data_root + 'bevdetv2-nuscenes-TC2_infos_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
         use_valid_flag=True,
         # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
         # and box_type_3d='Depth' in sunrgbd and scannet dataset.
-        box_type_3d='LiDAR')),
+        box_type_3d='LiDAR')
+        ),
     val=test_data_config,
     test=test_data_config)
 
@@ -272,11 +360,21 @@ custom_hooks = [
         type='MEGVIIEMAHook',
         init_updates=10560,
         priority='NORMAL',
+        resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0529-bevdet4d-r34-depthlossv2-noTC_node4/epoch_4_ema.pth"
+        # resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0503-bevdet4d-r50-depth-cbgs-res34-TC_afterfusion/epoch_4_ema.pth"
+
     ),
     dict(
         type='SequentialControlHook',
         temporal_start_epoch=3,
     ),
+    dict(
+        type='ObjectTemporalConsistencyHook',
+        loss_start_epoch=3,
+        depth_loss_end_epoch=99
+
+    ),
+
 ]
 
 log_config = dict(
@@ -285,4 +383,5 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook')
     ])
+
 # fp16 = dict(loss_scale='dynamic')

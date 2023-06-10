@@ -11,7 +11,10 @@ import mmcv
 import torch
 import torch.distributed as dist
 from mmcv import Config, DictAction
+# from mmengine import Config, DictAction
+
 from mmcv.runner import get_dist_info, init_dist
+# from mmengine.runner import get_dist_info, init_dist
 
 from mmdet import __version__ as mmdet_version
 from mmdet3d import __version__ as mmdet3d_version
@@ -113,10 +116,33 @@ def parse_args():
     return args
 
 
+def get_gpu_id(num_gpu=1):
+    """get ID of GPUS
+    :param num_gpu:  num of GPUs to use
+    :return: gpu_id: ID of allocated GPUs
+    """
+    from gpuinfo import GPUInfo
+    available_device = GPUInfo.check_empty()
+    if len(available_device) >= num_gpu:
+        gpu_id = available_device[:num_gpu]
+    else:
+        raise Exception('Only {} GPUs to use!'.format(len(available_device)))
+    if num_gpu == 1:
+        gpu_id = gpu_id[0]
+
+    return gpu_id
+
 def main():
+    # abc = get_gpu_id(2)
+    device_count = torch.cuda.device_count()
+    for i in range(device_count):
+        print(f"Device {i}:{torch.cuda.get_device_name(i)} is available ")
+
+
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
+    print(cfg.pretty_text)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
 

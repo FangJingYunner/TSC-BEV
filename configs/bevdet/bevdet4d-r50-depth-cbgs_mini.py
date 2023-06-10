@@ -39,7 +39,7 @@ grid_config = {
 
 voxel_size = [0.1, 0.1, 0.2]
 
-numC_Trans = 40
+numC_Trans = 80
 
 multi_adj_frame_id_cfg = (1, 8+1, 1)
 
@@ -48,9 +48,9 @@ model = dict(
     align_after_view_transfromation=False,
     num_adj=len(range(*multi_adj_frame_id_cfg)),
     img_backbone=dict(
-        pretrained='torchvision://resnet34',
+        pretrained='torchvision://resnet50',
         type='ResNet',
-        depth=34,
+        depth=50,
         num_stages=4,
         out_indices=(2, 3),
         frozen_stages=-1,
@@ -60,8 +60,8 @@ model = dict(
         style='pytorch'),
     img_neck=dict(
         type='CustomFPN',
-        in_channels=[256, 512],
-        out_channels=256,
+        in_channels=[1024, 2048],
+        out_channels=512,
         num_outs=1,
         start_level=0,
         out_ids=[0]),
@@ -69,7 +69,7 @@ model = dict(
         type='LSSViewTransformerBEVDepth',
         grid_config=grid_config,
         input_size=data_config['input_size'],
-        in_channels=256,
+        in_channels=512,
         out_channels=numC_Trans,
         depthnet_cfg=dict(use_dcn=False),
         downsample=16),
@@ -80,7 +80,7 @@ model = dict(
     img_bev_encoder_neck=dict(
         type='FPN_LSS',
         in_channels=numC_Trans * 8 + numC_Trans * 2,
-        out_channels=128),
+        out_channels=256),
     pre_process=dict(
         type='CustomResNet',
         numC_input=numC_Trans,
@@ -90,7 +90,7 @@ model = dict(
         backbone_output_ids=[0,]),
     pts_bbox_head=dict(
         type='CenterHead',
-        in_channels=128,
+        in_channels=256,
         tasks=[
             dict(num_class=1, class_names=['car']),
             dict(num_class=2, class_names=['truck', 'construction_vehicle']),
@@ -233,10 +233,8 @@ test_data_config = dict(
     ann_file=data_root + 'bevdetv2-nuscenes-mini_infos_val.pkl')
 
 data = dict(
-    samples_per_gpu=2,
-    workers_per_gpu=8,
-    pin_memory=True,
-    persistent_workers=False,
+    samples_per_gpu=4,
+    workers_per_gpu=16,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -265,7 +263,7 @@ lr_config = dict(
     warmup_iters=200,
     warmup_ratio=0.001,
     step=[20,])
-runner = dict(type='EpochBasedRunner', max_epochs=20)
+runner = dict(type='EpochBasedRunner', max_epochs=200)
 
 custom_hooks = [
     dict(
@@ -275,14 +273,8 @@ custom_hooks = [
     ),
     dict(
         type='SequentialControlHook',
-        temporal_start_epoch=3,
+        temporal_start_epoch=30,
     ),
 ]
 
-log_config = dict(
-    interval=10,
-    hooks=[
-        dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
-    ])
 # fp16 = dict(loss_scale='dynamic')

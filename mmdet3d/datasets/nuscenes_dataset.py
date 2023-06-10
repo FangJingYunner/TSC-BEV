@@ -232,7 +232,7 @@ class NuScenesDataset(Custom3DDataset):
         input_dict = dict(
             sample_idx=info['token'],
             pts_filename=info['lidar_path'],
-            sweeps=info['sweeps'],
+            # sweeps=info['sweeps'][0:(self.multi_adj_frame_id_cfg[1]-self.multi_adj_frame_id_cfg[0])],
             timestamp=info['timestamp'] / 1e6,
         )
         if 'ann_infos' in info:
@@ -269,9 +269,16 @@ class NuScenesDataset(Custom3DDataset):
                     input_dict['ann_info'] = annos
             else:
                 assert 'bevdet' in self.img_info_prototype
+                # info.pop("sweeps")
+                # del info['sweeps']
+                sweeps_info = info['sweeps'][0:(self.multi_adj_frame_id_cfg[1] - self.multi_adj_frame_id_cfg[0])]
+                # [value for value in map(lambda index: info.pop(index) if info.get(index) else None, ["sweeps"])]
                 input_dict.update(dict(curr=info))
                 if '4d' in self.img_info_prototype:
                     info_adj_list = self.get_adj_info(info, index)
+                    input_dict.update(dict(adjacent=info_adj_list))
+                elif 'TC' in self.img_info_prototype:
+                    info_adj_list = self.get_TCadj_info(info,sweeps_info, index)
                     input_dict.update(dict(adjacent=info_adj_list))
         return input_dict
 
@@ -284,6 +291,27 @@ class NuScenesDataset(Custom3DDataset):
                 info_adj_list.append(info)
             else:
                 info_adj_list.append(self.data_infos[select_id])
+        return info_adj_list
+
+    def get_TCadj_info(self, curr_info, sweeps_info, index):
+        info_adj_list = []
+        # sweeps_info = input_dict['sweeps']
+        # curr_info = input_dict['curr']
+
+        for select_id in range(*self.multi_adj_frame_id_cfg):
+            data_id = max(index - select_id, 0)
+            if not self.data_infos[data_id]['scene_token'] == curr_info[
+                    'scene_token']:
+                info_adj_list.append(curr_info)
+            else:
+                prev_data_info = self.data_infos[data_id]
+                required_prev_data_info = {}
+                if select_id <= len(sweeps_info):
+                    if prev_data_info['timestamp'] == sweeps_info[select_id - 1]['timestamp']:
+                        prev_data_info['relation2curr'] = sweeps_info[select_id - 1]#历史帧和当前帧的关系
+                        # [value for value in map(lambda index: prev_data_info.pop(index) if prev_data_info.get(index) else None, ["sweeps"])]
+                # prev_data_info.pop('sweeps')
+                info_adj_list.append(prev_data_info)
         return info_adj_list
 
     def get_ann_info(self, index):

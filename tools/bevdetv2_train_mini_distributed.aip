@@ -1,0 +1,29 @@
+#CSUB -J gpua100_b18_node4_mini_epoch20_lr0002
+#CSUB -q gpu_a100
+#CSUB -o %J.out
+#CSUB -e %J.error
+#CSUB -n 24      # 6 for 1*A100, other numbers are not allowed
+#CSUB -Is       # if your job doesn't need print, remove this parameters
+#CSUB -R "span[hosts=1]"   ##make sure job runs on one GPU server
+#CSUB -cwd /share/home/sjtu_fangjy/gpu  #change to your job scripts catalog
+env | grep CUDA
+
+echo "my home directory"
+pwd
+echo "*******************************"
+echo "list files in my home directory"
+echo "*******************************"
+ls
+module load cuda/11.1
+module load gcc/7.5.0
+nvidia-smi
+gcc -v
+module load anaconda3/4.12.0
+source /share/apps/anaconda3/bin/activate
+conda activate fjy_torch111py38
+conda env list 
+cd /share/home/sjtu_fangjy/py_ws/BEVDet
+set -x
+#export CUDA_VISIBLE_DEVI
+
+python -m torch.distributed.launch --nproc_per_node=4 tools/train.py /share/home/sjtu_fangjy/py_ws/BEVDet/configs/bevdet/bevdet4d-r50-depth-cbgs.py --seed 0 --launcher pytorch

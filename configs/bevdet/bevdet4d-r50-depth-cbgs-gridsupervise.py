@@ -44,7 +44,7 @@ numC_Trans = 40
 multi_adj_frame_id_cfg = (1, 8+1, 1)
 
 model = dict(
-    type='BEVDepth4D',
+    type='BEVDepth4DHigh',
     align_after_view_transfromation=False,
     num_adj=len(range(*multi_adj_frame_id_cfg)),
     img_backbone=dict(
@@ -88,9 +88,22 @@ model = dict(
         num_channels=[numC_Trans,],
         stride=[1,],
         backbone_output_ids=[0,]),
+    # bev_structure_reg_head=dict(
+    #     type='BEVStructureRegHead',
+    #     init_cfg = None,
+    #     bev_high_weight=0.1,
+    #     out_channel = 1,
+    #     use_mask = False),
+
+    # bev_temporal_consistance_loss=dict(
+    #     type='bev_temporal_consistance_loss',
+    #     init_cfg=None,
+    #     weight=0.5,
+    #     ),
+
     pts_bbox_head=dict(
         type='CenterHead',
-        in_channels=128,
+        in_channels=128, #concat bev_structure_reg_head
         tasks=[
             dict(num_class=1, class_names=['car']),
             dict(num_class=2, class_names=['truck', 'construction_vehicle']),
@@ -127,7 +140,8 @@ model = dict(
             gaussian_overlap=0.1,
             max_objs=500,
             min_radius=2,
-            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),
+            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        object_temporal_consistance_loss=dict(weight=1, before_fusion=True)),
     test_cfg=dict(
         pts=dict(
             pc_range=point_cloud_range[:2],
@@ -174,16 +188,19 @@ train_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=5,
-        use_dim=5,
+        load_dim=3,
+        use_dim=3,
         file_client_args=file_client_args),
     dict(type='PointToMultiViewDepth', downsample=1, grid_config=grid_config),
+    # dict(type='PointToGridStructure', grid_minpts=5, grid_config=grid_config, point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='BEVObjectCornerAnnotation', grid_config=grid_config, point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(
-        type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
-                                'gt_depth'])
+    dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+                                'gt_depth', 'corner_relation'])
+    # dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+    #                              'gt_depth'])
 ]
 
 test_pipeline = [
@@ -224,24 +241,22 @@ share_data_config = dict(
     type=dataset_type,
     classes=class_names,
     modality=input_modality,
-    img_info_prototype='bevdet4d',
+    img_info_prototype='bevdet4dTC',
     multi_adj_frame_id_cfg=multi_adj_frame_id_cfg,
 )
 
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file=data_root + 'bevdetv2-nuscenes-mini_infos_val.pkl')
+    ann_file=data_root + 'bevdetv2-nuscenes-TC_infos_val.pkl')
 
 data = dict(
     samples_per_gpu=2,
-    workers_per_gpu=8,
-    pin_memory=True,
-    persistent_workers=False,
+    workers_per_gpu=0,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes-mini_infos_train.pkl',
+        ann_file=data_root + 'bevdetv2-nuscenes-TC_infos_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -275,14 +290,13 @@ custom_hooks = [
     ),
     dict(
         type='SequentialControlHook',
-        temporal_start_epoch=3,
+        temporal_start_epoch=-1,
     ),
+    dict(
+        type='ObjectTemporalConsistencyHook',
+        loss_start_epoch=-1,
+    ),
+
 ]
 
-log_config = dict(
-    interval=10,
-    hooks=[
-        dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
-    ])
 # fp16 = dict(loss_scale='dynamic')
