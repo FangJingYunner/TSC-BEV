@@ -413,6 +413,11 @@ class BEVDet4D(BEVDet):
                 if key_frame:
                     bev_feat, depth = self.prepare_bev_feat(*inputs_curr)
                 else:
+                    # if "has_auxiliary" in kwargs and kwargs["has_auxiliary"] == True:
+                    #     bev_feat, depth = self.prepare_bev_feat(*inputs_curr)
+                    # else:
+                    #     with torch.no_grad():
+                    #         bev_feat, depth = self.prepare_bev_feat(*inputs_curr)
                     with torch.no_grad():
                         bev_feat, depth = self.prepare_bev_feat(*inputs_curr)
             else:
@@ -740,6 +745,7 @@ class BEVDepthTCAuxiliary(BEVDet4D):
 
         self.tcl_start_flag = False
 
+        self.has_auxiliary = False
         if auxiliary_pts_bbox_head:
             pts_train_cfg = kwargs["train_cfg"].pts if kwargs["train_cfg"] else None
             auxiliary_pts_bbox_head.update(train_cfg=pts_train_cfg)
@@ -747,6 +753,7 @@ class BEVDepthTCAuxiliary(BEVDet4D):
             auxiliary_pts_bbox_head.update(test_cfg=pts_test_cfg)
             self.auxiliary_pts_bbox_head = builder.build_head(auxiliary_pts_bbox_head)
             # self.auxiliary_weight = kwargs["train_cfg"].auxiliary_weight if kwargs["train_cfg"].auxiliary_weight else 0.125
+            # self.has_auxiliary = True
 
     def sweeps_forward_pts_train(self,
                           pts_feats,
@@ -930,7 +937,7 @@ class BEVDepthTCAuxiliary(BEVDet4D):
         Returns:
             dict: Losses of different branches.
         """
-
+        kwargs["has_auxiliary"] = self.has_auxiliary
         img_feats, pts_feats, depth, bev_feats_list = self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
 
@@ -971,34 +978,41 @@ class BEVDepthTCAuxiliary(BEVDet4D):
         losses.update(losses_pts)
 
 
-        if self.with_prev:
-            sweeps_gt_boxes = kwargs["sweeps_gt_boxes"]
-            sweeps_gt_labels = kwargs["sweeps_gt_labels"]
-            sweeps_gt_boxes = list(map(list,zip(*sweeps_gt_boxes)))
-            sweeps_gt_labels = list(map(list,zip(*sweeps_gt_labels)))
 
-            prev_losses = dict()
-            for i in range(len(sweeps_gt_boxes)):
-                prev_feat_input = list()
-                prev_feat_input.append(bev_feats_list[i+1])
-                sweep_losses_pts = self.sweeps_forward_pts_train(prev_feat_input, sweeps_gt_boxes[i],
-                                                    sweeps_gt_labels[i], img_metas,
-                                                    gt_bboxes_ignore)
-                for (key,value) in sweep_losses_pts.items():
-                    key = key+"prev"
-                    if key in prev_losses.keys():
-                        prev_losses[key] = prev_losses[key]
-                    else:
-                        prev_losses[key] = value
+        # if self.with_prev:
+        #
+        #     sweeps_gt_boxes = kwargs["sweeps_gt_boxes"]
+        #     sweeps_gt_labels = kwargs["sweeps_gt_labels"]
+        #     sweeps_gt_boxes = list(map(list,zip(*sweeps_gt_boxes)))
+        #     sweeps_gt_labels = list(map(list,zip(*sweeps_gt_labels)))
+        #
+        #     prev_losses = dict()
+        #     for i in range(len(sweeps_gt_boxes)):
+        #         prev_feat_input = list()
+        #         prev_feat_input.append(bev_feats_list[i+1])
+        #         sweep_losses_pts = self.sweeps_forward_pts_train(prev_feat_input, sweeps_gt_boxes[i],
+        #                                             sweeps_gt_labels[i], img_metas,
+        #                                             gt_bboxes_ignore)
+        #         for (key,value) in sweep_losses_pts.items():
+        #             key = key+"prev"
+        #             if key in prev_losses.keys():
+        #                 prev_losses[key] += prev_losses[key]
+        #             else:
+        #                 prev_losses[key] = value
 
-            # for (key, value) in sweep_losses_pts.items():
-            #     prev_losses[key] = prev_losses[key]*self.auxiliary_weight
+        feats = list()
+        prev_losses = dict()
+        feats.append(bev_feats_list[0])
+        sweep_losses_pts = self.sweeps_forward_pts_train(feats, gt_bboxes_3d,
+                                                gt_labels_3d, img_metas,
+                                                gt_bboxes_ignore)
+        for (key,value) in sweep_losses_pts.items():
+            key = key+"prev"
+            if key in prev_losses.keys():
+                prev_losses[key] += prev_losses[key]
+            else:
+                prev_losses[key] = value
 
-            # sweep_losses_pts = self.sweeps_forward_pts_train(bev_feats_list[1:], sweeps_gt_boxes,
-            #                                     sweeps_gt_labels, img_metas,
-            #                                     gt_bboxes_ignore)
-            # for (key, value) in sweep_losses_pts.items():
-            #     prev_losses[key] = sweep_losses_pts[key]*self.auxiliary_weight
             losses.update(prev_losses)
 
         return losses

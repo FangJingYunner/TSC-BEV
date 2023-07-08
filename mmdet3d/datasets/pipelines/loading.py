@@ -1174,9 +1174,17 @@ class LoadAnnotationsBEVDepth(object):
         )
         bda_mat = torch.zeros(4, 4)
         bda_mat[3, 3] = 1
+        #origin
         gt_boxes, bda_rot = self.bev_transform(gt_boxes, rotate_bda, scale_bda,
                                                flip_dx, flip_dy)
         bda_mat[:3, :3] = bda_rot
+
+        #change
+        # gt_boxes, bda_rot = self.bev_transform(gt_boxes, rotate_bda, scale_bda,
+        #                                        flip_dx, flip_dy)
+        # bda_mat[:3, :3] = bda_mat
+        # bda_rot = bda_mat[:3, :3]
+
         if len(gt_boxes) == 0:
             gt_boxes = torch.zeros(0, 9)
         results['gt_bboxes_3d'] = \
@@ -1195,10 +1203,11 @@ class LoadAnnotationsBEVDepth(object):
 @PIPELINES.register_module()
 class LoadSweepsAnnotationsBEVDepth(object):
 
-    def __init__(self, bda_aug_conf, classes, is_train=True):
+    def __init__(self, bda_aug_conf, classes, point_cloud_range, is_train=True):
         self.bda_aug_conf = bda_aug_conf
         self.is_train = is_train
         self.classes = classes
+        self.pcd_range = np.array(point_cloud_range, dtype=np.float32)
 
     def sample_bda_augmentation(self):
         """Generate bda augmentation values based on bda_config."""
@@ -1303,23 +1312,43 @@ class LoadSweepsAnnotationsBEVDepth(object):
             sweep_gt_boxes, sweep_gt_labels = sweep_ann_infos['ann_infos']
             sweep_gt_boxes, sweep_gt_labels = torch.Tensor(np.array(sweep_gt_boxes)), torch.tensor(np.array(sweep_gt_labels))
 
-            # sweep_gt_boxes[:,0:3] = (l02l1[:3,:3] @ sweep_gt_boxes[:,0:3].unsqueeze(-1) + l02l1[:3,3].unsqueeze(-1)).squeeze(-1)
-            # sweep_gt_boxes_t = LiDARInstance3DBoxes(sweep_gt_boxes, box_dim=sweep_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
-            # sweep_gt_boxes_t = sweep_gt_boxes_t.rotate(l02l1[:3, :3])
-            # sweep_gt_boxes_t.rotate(bda_rot)
+            if sweep_gt_boxes.shape[0] > 0:
+                # sweep_gt_boxes[:,0:3] = (l02l1[:3,:3] @ sweep_gt_boxes[:,0:3].unsqueeze(-1) + l02l1[:3,3].unsqueeze(-1)).squeeze(-1)
+                # sweep_gt_boxes_t = LiDARInstance3DBoxes(sweep_gt_boxes, box_dim=sweep_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
+                # sweep_gt_boxes_t = sweep_gt_boxes_t.rotate(l02l1[:3, :3])
+                # sweep_gt_boxes_t.rotate(bda_rot)
+                # try:
+                #     if len(sweep_gt_boxes) > 0:
+                #gt sweep bbox adjego convert to current ego
+                rot_sin = (l12l0[0, 1]+l12l0[1,0])/2
+                rot_cos = (l12l0[0, 0]+l12l0[1,1])/2
+                angle = np.arctan2(rot_sin, rot_cos)
+                sweep_gt_boxes[:, :3] = sweep_gt_boxes[:,:3].matmul(l12l0[:3, :3].T)+l12l0[:3, 3].unsqueeze(0)
+                sweep_gt_boxes[:, 6] += angle
+                # rotate velo vector
+                sweep_gt_boxes[:, 7:9] = sweep_gt_boxes[:, 7:9].matmul(l12l0[:2, :2].T)
+                # except:
+                #     print("sweep_gt_boxes shape:{}".format(sweep_gt_boxes.shape))
+                #     print("l12l0 shape:{}".format(l12l0.shape))
 
-            sweep_gt_boxes, bda_rot = self.bev_transform(sweep_gt_boxes, rotate_bda, scale_bda,flip_dx, flip_dy)
+                #bda
+                sweep_gt_boxes, bda_rot = self.bev_transform(sweep_gt_boxes, rotate_bda, scale_bda,flip_dx, flip_dy)
 
-            #gt bbox convert to current frame
-            # rot_sin = (l12l0[0, 1]+l12l0[1,0])/2
-            # rot_cos = (l12l0[0, 0]+l12l0[1,1])/2
-            # angle = np.arctan2(rot_sin, rot_cos)
-            # sweep_gt_boxes[:, 0:3] = sweep_gt_boxes[:, 0:3] @ l12l0[:3, :3]+l12l0[:3, 3]
-            # sweep_gt_boxes[:, 6] -= angle
-            # # rotate velo vector
-            # sweep_gt_boxes[:, 7:9] = sweep_gt_boxes[:, 7:9] @ l12l0[:2, :2]
+                sweep_gt_boxes = LiDARInstance3DBoxes(sweep_gt_boxes, box_dim=sweep_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
 
-            sweep_gt_boxes = LiDARInstance3DBoxes(sweep_gt_boxes, box_dim=sweep_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
+                bev_range = self.pcd_range[[0, 1, 3, 4]]
+
+                mask = sweep_gt_boxes.in_range_bev(bev_range)
+                sweep_gt_boxes = sweep_gt_boxes[mask]
+                # mask is a torch tensor but gt_labels_3d is still numpy array
+                # using mask to index gt_labels_3d will cause bug when
+                # len(gt_labels_3d) == 1, where mask=1 will be interpreted
+                # as gt_labels_3d[1] and cause out of index error
+                sweep_gt_labels = sweep_gt_labels[mask.numpy().astype(np.bool)]
+
+                # limit rad to [-pi, pi]
+                sweep_gt_boxes.limit_yaw(offset=0.5, period=2 * np.pi)
+
             results["sweeps_gt_boxes"].append(sweep_gt_boxes)
             results["sweeps_gt_labels"].append(sweep_gt_labels)
             results["adjego2currego"].append(l12l0)
@@ -1366,8 +1395,8 @@ class PointToGridStructure(object):
         points_lidar.tensor[:, :3] = points_lidar.tensor[:, :3].matmul(
             lidar2lidarego[:3, :3].T) + lidar2lidarego[:3, 3].unsqueeze(0)
 
+        points_lidar.tensor[:, :3] = points_lidar.tensor[:, :3].matmul(bda.T)
 
-        points_lidar.rotate(bda)
         points_kept_flag = points_lidar.in_range_3d(self.point_cloud_range)
         points_lidar = points_lidar[points_kept_flag]
 
@@ -1440,11 +1469,16 @@ class PointToGridStructure(object):
                 lidar2lidarego[:3, :3].T) + lidar2lidarego[:3, 3].unsqueeze(0)
 
             # points_lidar = points_lidars.clone()
-            points_lidar.rotate(bda)
+
+
 
             #pts convert to current frame
-            points_lidar.tensor[:,:3] = points_lidar.tensor[:,:3] @ adj2current[:3, :3]+adj2current[:3, 3]
+            # points_lidar.tensor[:,:3] = points_lidar.tensor[:,:3].matmul(adj2current[:3, :3].T) +adj2current[:3, 3].unsqueeze(0)
+            # points_lidar.rotate(bda)
+            points_lidar.tensor[:, :3] = points_lidar.tensor[:, :3].matmul(bda.T)
 
+            # points_lidar.tensor[:, :3].matmul(
+            #     lidar2lidarego[:3, :3].T) + lidar2lidarego[:3, 3].unsqueeze(0)
 
             points_kept_flag = points_lidar.in_range_3d(self.point_cloud_range)
             points_lidar = points_lidar[points_kept_flag]
@@ -1632,7 +1666,7 @@ class BEVObjectCornerAnnotation(object):
         # import matplotlib.pyplot as plt
         # plt.imshow(gt_bev_mask.squeeze(0).numpy(), cmap='binary')
         # plt.show()
-        # # gt_bev_mask_b = torch.zeros_like(gt_bev_mask)
+        # gt_bev_mask_b = torch.zeros_like(gt_bev_mask)
         # gt_bev_mask_b = gt_bev_mask.clone()
         # for i in range(curr_corner_coor.shape[0]):
         #     for j in range(curr_corner_coor.shape[1]):
@@ -1643,7 +1677,7 @@ class BEVObjectCornerAnnotation(object):
         # gt_bev_mask_b = gt_bev_mask.clone()
         # for i in range(curr_corner_coor.shape[0]):
         #     for j in range(curr_corner_coor.shape[1]):
-        #         if curr_corner_mask[i,0, j, 0] == 0:
+        #         if curr_corner_mask[i,0, j, 0] == 1:
         #             gt_bev_mask_b[:,curr_corner_coor[i, j, 0].long(),curr_corner_coor[i, j, 1].long()] = 2
         # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
         # plt.show()
@@ -1651,7 +1685,7 @@ class BEVObjectCornerAnnotation(object):
         # gt_bev_mask_b = gt_bev_mask.clone()
         # for i in range(curr_corner_coor.shape[0]):
         #     for j in range(curr_corner_coor.shape[1]):
-        #         if curr_corner_mask[i,0, j, 0] == 1:
+        #         if curr_corner_mask[i,0, j, 0] == 0:
         #             gt_bev_mask_b[:,curr_corner_coor[i, j, 0].long(),curr_corner_coor[i, j, 1].long()] = 3
         # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
         # plt.show()
@@ -1697,15 +1731,19 @@ class BEVObjectCornerAnnotation(object):
                 # pass
                 # # gt_boxes, gt_labels = results['ann_infos']
                 filtered_gt_boxes, filtered_gt_labels = torch.Tensor(np.array(filtered_gt_boxes)), torch.tensor(np.array(filtered_gt_labels))
+
+
+                # rot_sin = (adjego2currego[0, 1]+adjego2currego[1, 0])/2
+                # rot_cos = (adjego2currego[0, 0]+adjego2currego[1, 1])/2
+                # angle = np.arctan2(rot_sin, rot_cos)
+                # filtered_gt_boxes[:, 0:3] = filtered_gt_boxes[:, 0:3].matmul(adjego2currego[:3, :3].T)+adjego2currego[:3, 3].unsqueeze(0)
+                # filtered_gt_boxes[:, 6] += angle
+                # # rotate velo vector
+                # filtered_gt_boxes[:, 7:9] = filtered_gt_boxes[:, 7:9].matmul(adjego2currego[:2, :2].T)
+
+                #bda
                 filtered_gt_boxes, bda_rot = self.bev_transform(filtered_gt_boxes, rotate_bda, scale_bda, flip_dx, flip_dy)
 
-                rot_sin = (adjego2currego[0, 1]+adjego2currego[1,0])/2
-                rot_cos = (adjego2currego[0, 0]+adjego2currego[1,1])/2
-                angle = np.arctan2(rot_sin, rot_cos)
-                filtered_gt_boxes[:, 0:3] = filtered_gt_boxes[:, 0:3] @ adjego2currego[:3, :3]+adjego2currego[:3, 3]
-                filtered_gt_boxes[:, 6] -= angle
-                # rotate velo vector
-                filtered_gt_boxes[:, 7:9] = filtered_gt_boxes[:, 7:9] @ adjego2currego[:2, :2]
 
                 filtered_gt_boxes = LiDARInstance3DBoxes(filtered_gt_boxes, box_dim=filtered_gt_boxes.shape[-1], origin=(0.5, 0.5, 0.5))
 
@@ -1749,30 +1787,20 @@ class BEVObjectCornerAnnotation(object):
                 keep_indices = np.array(keep_indices).squeeze()
                 curr_corner_tensor[keep_indices, :, 2*(1+index):2*(2+index)] = corner_points_coors
 
-                if self.lidar_guided:
-                    mask = torch.tensor(
-                        [gt_bev_mask[..., corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] for i in
-                         range(corner_points_coors.shape[0]) for j in range(corner_points_coors.shape[1])], dtype=torch.float32)
-                    mask = mask.reshape(corner_points_coors.shape[0], corner_points_coors.shape[1], 1)
-                    # corner_points_coors = torch.cat((corner_points_coors[..., :2], mask), dim=-1).long()
-                    # nonzero_idx = torch.nonzero(curr_corner_coor_t[:,:,-1])
-
-                    for i, obj_mask in enumerate(mask):
-                        row_indices, col_indices = torch.where(obj_mask == 1)
-                        curr_corner_mask[i, index+1, row_indices, row_indices[:, None]] = 1
+                # if self.lidar_guided:
+                #     mask = torch.tensor(
+                #         [gt_bev_mask[..., corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] for i in
+                #          range(corner_points_coors.shape[0]) for j in range(corner_points_coors.shape[1])], dtype=torch.float32)
+                #     mask = mask.reshape(corner_points_coors.shape[0], corner_points_coors.shape[1], 1)
+                #
+                #     for i, obj_mask in enumerate(mask):
+                #         row_indices, col_indices = torch.where(obj_mask == 1)
+                #         curr_corner_mask[i, index+1, row_indices, row_indices[:, None]] = 1
 
                 # plt.imshow(gt_bev_mask.squeeze(0).numpy(), cmap='binary')
                 # plt.show()
                 # # gt_bev_mask_b = torch.zeros_like(gt_bev_mask)
-                # gt_bev_mask_b = gt_bev_mask.clone()
-                # for i in range(corner_points_coors.shape[0]):
-                #     for j in range(corner_points_coors.shape[1]):
-                #         if curr_corner_mask[i, index+1, j, 0] == 0:
-                #             gt_bev_mask_b[:, corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] = 2
-                #         elif curr_corner_mask[i, index+1, j, 0] == 1:
-                #             gt_bev_mask_b[:, corner_points_coors[i, j, 0].long(), corner_points_coors[i, j, 1].long()] = 3
-                # plt.imshow(gt_bev_mask_b.squeeze(0).numpy(), cmap='gray')
-                # plt.show()
+
 
         results['corner_relation'] = curr_corner_tensor
         results['corner_mask'] = curr_corner_mask

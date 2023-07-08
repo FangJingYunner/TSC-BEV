@@ -658,6 +658,8 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
         if isinstance(gt_depths,list):
             #test模式传进来的是list
             gt_depths = gt_depths[0]
+        gt_depths_test = gt_depths.clone()
+
         B, N, H, W = gt_depths.shape
         gt_depths = gt_depths.view(B * N, H // self.downsample,
                                    self.downsample, W // self.downsample,
@@ -681,13 +683,14 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
         S,_ = gt_depths.shape
         gt_depths_loss = torch.zeros((gt_depths.shape[0],int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2])),device=gt_depths.device)
 
-        for index in range(S):
-            histogram = torch.histc(gt_depths[index, :], bins=int(
-                (self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]), min=self.grid_config['depth'][0],
-                                    max=(self.grid_config['depth'][1] - self.grid_config['depth'][0]) /
-                                        self.grid_config['depth'][2])
 
+        bins_num = int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2])
+        max_num = self.grid_config['depth'][1] - self.grid_config['depth'][0] /self.grid_config['depth'][2]
+        for index in range(S):
+            histogram = torch.histc(gt_depths[index, :], bins=bins_num, min=self.grid_config['depth'][0],max=max_num)
             gt_depths_loss[index,:]=histogram
+
+
         # gt_depths_train = F.one_hot(
         #     gt_depths.long(), num_classes=self.D + 1)[..., 1:]
         # gt_depths_train = gt_depths_train.permute(0, 3, 1, 2).contiguous()
@@ -827,7 +830,8 @@ class LSSViewTransformerBEVDepthWithGT(LSSViewTransformer):
         self.context_net = ContextNet(self.in_channels, self.in_channels,
                                   self.out_channels, self.D, **depthnet_cfg)
         self.depth_type = depth_type
-
+        self.bins_num=int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2])
+        self.max_depth=(self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]
     def get_mlp_input(self, rot, tran, intrin, post_rot, post_tran, bda):
         B, N, _, _ = rot.shape
         bda = bda.view(B, 1, 3, 3).repeat(1, N, 1, 1)
@@ -927,10 +931,7 @@ class LSSViewTransformerBEVDepthWithGT(LSSViewTransformer):
         gt_depths_loss = torch.zeros((gt_depths.shape[0],int((self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2])),device=gt_depths.device)
 
         for index in range(S):
-            histogram = torch.histc(gt_depths[index, :], bins=int(
-                (self.grid_config['depth'][1] - self.grid_config['depth'][0]) / self.grid_config['depth'][2]), min=1,
-                                    max=(self.grid_config['depth'][1] - self.grid_config['depth'][0]) /
-                                        self.grid_config['depth'][2])
+            histogram = torch.histc(gt_depths[index, :], bins=self.bins_num, min=1, max=self.max_depth)
 
             gt_depths_loss[index,:]=histogram
         # gt_depths_train = F.one_hot(
