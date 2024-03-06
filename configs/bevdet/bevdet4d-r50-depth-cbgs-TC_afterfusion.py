@@ -45,21 +45,21 @@ grid_config = {
 
 voxel_size = [0.1, 0.1, 0.2]
 
-numC_Trans = 40
+numC_Trans = 80
 
 multi_adj_frame_id_cfg = (1, 8+1, 1)
 
 model = dict(
-    depth_loss_type="v2",  # v1 original loss v2: 我修改的loss gt:深度估计没有监督
+    depth_loss_type="v1",  # v1 original loss v2: 我修改的loss gt:深度估计没有监督
     type='BEVDepth4DHigh',
     align_after_view_transfromation=False,
     num_adj=len(range(*multi_adj_frame_id_cfg)),
     img_backbone=dict(
-        pretrained='torchvision://resnet34',
+        pretrained='torchvision://resnet50',
         type='ResNet',
-        depth=34,
+        depth=50,
         num_stages=4,
-        out_indices=(2, 3),
+        out_indices=(1, 2, 3),
         frozen_stages=-1,
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=False,
@@ -67,20 +67,22 @@ model = dict(
         style='pytorch'),
     img_neck=dict(
         type='CustomFPN',
-        in_channels=[256, 512],
-        out_channels=256,
+        in_channels=[512, 1024, 2048],
+        out_channels=512,
         num_outs=1,
         start_level=0,
-        out_ids=[0]),
+        out_ids=[0,1]),
     img_view_transformer=dict(
         type='LSSViewTransformerBEVDepth',
         grid_config=grid_config,
         input_size=data_config['input_size'],
-        in_channels=256,
+        in_channels=512,
         out_channels=numC_Trans,
         depthnet_cfg=dict(use_dcn=False),
-        downsample=16,
-        loss_depth_weight=5),
+        downsample=8,
+        # accelerate=True,
+        # loss_depth_weight=5
+    ),
     # img_view_transformer=dict(
     #     type='LSSViewTransformerBEVDepthWithGT',
     #     grid_config=grid_config,
@@ -97,7 +99,7 @@ model = dict(
     img_bev_encoder_neck=dict(
         type='FPN_LSS',
         in_channels=numC_Trans * 8 + numC_Trans * 2,
-        out_channels=128),
+        out_channels=256),
     pre_process=dict(
         type='CustomResNet',
         numC_input=numC_Trans,
@@ -120,7 +122,7 @@ model = dict(
 
     pts_bbox_head=dict(
         type='CenterHead',
-        in_channels=128, #concat bev_structure_reg_head
+        in_channels=256, #concat bev_structure_reg_head
         tasks=[
             dict(num_class=1, class_names=['car']),
             dict(num_class=2, class_names=['truck', 'construction_vehicle']),
@@ -159,7 +161,8 @@ model = dict(
             min_radius=2,
             code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
             depth_loss="v1", #在LSSViewTransformerBEVDepthWithGT模块生效
-        object_temporal_consistance_loss=dict(weight=1, before_fusion=False,lidar_guided=False, use_half_feature=False,bilinear_interpolate=True)),
+        object_temporal_consistance_loss=dict(weight=3, before_fusion=False,lidar_guided=False, use_half_feature=False,bilinear_interpolate=True),
+        spatial_consistance_loss=dict(weight=10)),
     test_cfg=dict(
         pts=dict(
             pc_range=point_cloud_range[:2],
@@ -179,8 +182,10 @@ model = dict(
             ],
             nms_thr=[0.2, 0.2, 0.2, 0.2, 0.2, 0.5],
             nms_rescale_factor=[
-                1.0, [0.7, 0.7], [0.4, 0.55], 1.1, [1.0, 1.0], [4.5, 9.0]
+                1.0, [0.7, 0.7], [0.4, 0.55], 1.1, [1.2, 1.2], [5, 10]
             ])))
+
+
 
 # Data
 dataset_type = 'NuScenesDataset'
@@ -210,6 +215,12 @@ train_pipeline = [
         bda_aug_conf=bda_aug_conf,
         classes=class_names),
     dict(
+        type='LoadSweepsAnnotationsBEVDepth',
+        bda_aug_conf=bda_aug_conf,
+        classes=class_names,
+        point_cloud_range=point_cloud_range),
+
+    dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
@@ -225,7 +236,7 @@ train_pipeline = [
     dict(type='PointToMultiViewDepth', downsample=1, grid_config=grid_config),
     dict(type='PointToGridStructure', grid_minpts=1, grid_config=grid_config, point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='BEVObjectCornerAnnotation', grid_config=grid_config, point_cloud_range=point_cloud_range),
+    dict(type='BEVObjectCornerAnnotation', grid_config=grid_config, point_cloud_range=point_cloud_range, lidar_guided= True),
     dict(type='ObjectNameFilter', classes=class_names),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
@@ -284,10 +295,10 @@ test_data_config = dict(
     ann_file=data_root + 'bevdetv2-nuscenes-TC2_infos_val.pkl')
 
 data = dict(
-    samples_per_gpu=16,
-    workers_per_gpu=8,
+    samples_per_gpu=1,
+    workers_per_gpu=0,
     pin_memory=False,
-    persistent_workers=True,
+    persistent_workers=False,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -324,8 +335,14 @@ custom_hooks = [
         type='MEGVIIEMAHook',
         init_updates=10560,
         priority='NORMAL',
-        resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0604-bevdet4d-r50-depth-cbgs-TCafterfusionw1_depthv2_start3_bilinear_torch113/epoch_18_ema.pth"
-    ),
+        # resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0604-bevdet4d-r50-depth-cbgs-TCafterfusionw1_depthv2_start3_bilinear_torch113/epoch_18_ema.pth"
+        # resume = "/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0529-bevdet4d-r34-depthlossv2-noTC_node4/epoch_4_ema.pth"
+        # resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0604-bevdet4d-r50-depth-cbgs-TCafterfusionw1_depthv2_start3_bilinear_torch113/epoch_18_ema.pth"
+        # resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0503-bevdet4d-r50-depth-cbgs-res34-TC_afterfusion/epoch_4_ema.pth"
+        # resume = "/data/BEVDet/work_dirs/0803_depthv1_TCv2w3_SCv2w10_bilinear/epoch_4_ema.pth"
+        # resume="/share/home/sjtu_fangjy/py_ws/BEVDet/work_dirs/0529-bevdet4d-r34-depthlossv2-noTC_node4/epoch_4_ema.pth"
+
+),
     dict(
         type='SequentialControlHook',
         temporal_start_epoch=3,
@@ -333,8 +350,8 @@ custom_hooks = [
     dict(
         type='ObjectTemporalConsistencyHook',
         loss_start_epoch=3,
-        depth_loss_end_epoch=99
-
+        depth_loss_end_epoch=99,
+        sclloss_start_epoch=3
     ),
 
 ]

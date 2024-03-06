@@ -1,4 +1,5 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
+import numpy as np
 import torch
 import torch.nn.functional as F
 from mmcv.runner import force_fp32
@@ -9,6 +10,7 @@ from .. import builder
 from .centerpoint import CenterPoint
 from ..decode_heads.decode_head import Base3DDecodeHead
 import math
+import numpy as np
 
 @DETECTORS.register_module()
 class BEVDet(CenterPoint):
@@ -522,6 +524,11 @@ class BEVDepth4DHigh(BEVDet4D):
             self.bilinear_interpolate = self.train_cfg['object_temporal_consistance_loss']['bilinear_interpolate']
 
         self.tcl_start_flag = False
+        self.scl_start_flag = False
+
+
+        if self.train_cfg is not None and self.train_cfg['spatial_consistance_loss'] is not None:
+            self.spatial_consistance_weight = self.train_cfg['spatial_consistance_loss']['weight']
 
         # if auxiliary_pts_bbox_head:
         #     pts_train_cfg = kwargs["train_cfg"].pts if kwargs["train_cfg"] else None
@@ -649,6 +656,68 @@ class BEVDepth4DHigh(BEVDet4D):
         total_cos_loss_sum = self.temporal_consistance_weight*(torch.sum(total_cos_loss)/81/batchsize)
 
         return {'box_cos_sim_loss': total_cos_loss_sum}
+
+    def spatial_consistance_loss(self, img_feats, gt_labels_3d, corner_relation_list):
+
+        max_labels_size = len(max(gt_labels_3d, key=lambda x: x.size(0)))
+        _, C, H, W = img_feats.shape
+        batch_size = len(gt_labels_3d)
+
+        spatial_consistance_loss = 0;
+
+        for catagory_id in range(0,10):
+            instance_num_prebatch = list()
+            instance_location_tensor = torch.zeros((len(gt_labels_3d),1,max_labels_size, 2),device=img_feats.device)
+
+            for batch_id in range(batch_size):
+                instance_ids = torch.where(gt_labels_3d[batch_id] == catagory_id)
+                instance_location = corner_relation_list[batch_id][instance_ids]
+                if len(instance_location) == 0:
+                    instance_num_prebatch.append(0)
+                    continue;
+
+                else:
+                    instance_location = instance_location[:,4,:2]
+                    instance_num_prebatch.append(len(instance_location))
+
+                instance_location_tensor[batch_id, :, :len(instance_location), :]=instance_location
+                # instance_location_list.append(instance_location)
+
+            #如果该类别在每个batch中都没有，则continue
+            # if len(sum(instance_num_prebatch, key=lambda x: x.size(0))) == 0:
+            #     continue
+            # else:
+            total_instance_num = np.sum([x for x in instance_num_prebatch])
+            if total_instance_num < 2:
+                continue
+
+
+            # curr_corner_relation = curr_corner_relation.unsqueeze(0).unsqueeze(0)
+            instance_location_tensor_norm = (2 * instance_location_tensor / W) - 1
+            bilinear_current_feat = F.grid_sample(img_feats,instance_location_tensor_norm,mode='bilinear')
+            bilinear_current_feat = bilinear_current_feat.squeeze(2)
+
+            catagory_feature_list = list()
+            for batch_id in range(batch_size):
+                if instance_num_prebatch[batch_id] == 0:
+                    continue
+
+                catagory_feature_list.append(bilinear_current_feat[batch_id, :, :instance_num_prebatch[batch_id]])
+            catagory_feature = torch.cat(catagory_feature_list, dim=1)
+
+            catagory_feature_norm = torch.norm(catagory_feature, dim=0)
+
+
+            box_cos_sim = torch.mm(catagory_feature.t(), catagory_feature) / torch.mm(
+                catagory_feature_norm.unsqueeze(1), catagory_feature_norm.unsqueeze(0))
+
+            loss = torch.sum(torch.ones_like(box_cos_sim)-box_cos_sim)/torch.sum(torch.ones_like(box_cos_sim))
+
+            spatial_consistance_loss += loss
+
+        spatial_consistance_loss = self.spatial_consistance_weight * (spatial_consistance_loss/batch_size)
+        return {'spatial_consistance_loss': spatial_consistance_loss}
+
     def forward_train(self,
                       points=None,
                       img_metas=None,
@@ -708,10 +777,11 @@ class BEVDepth4DHigh(BEVDet4D):
         #     losses.update(bev_high_loss)
         #     img_feats[0] = torch.cat([img_feats[0], bev_high_feature], dim=1)
         #
-        if self.tcl_start_flag:
-            corner_relation = kwargs['corner_relation']
-            corner_mask = kwargs['corner_mask']
 
+        corner_relation = kwargs['corner_relation']
+        corner_mask = kwargs['corner_mask']
+
+        if self.tcl_start_flag:
             if self.before_fusion:
                 temporal_consistance_loss = self.temporal_consistance_loss(bev_feats_list[0], bev_feats_list, corner_relation,corner_mask)
                 # temporal_consistance_loss = self.temporal_consistance_loss(bev_feats_list[0], bev_feats_list, corner_relation)
@@ -725,6 +795,12 @@ class BEVDepth4DHigh(BEVDet4D):
                                             gt_labels_3d, img_metas,
                                             gt_bboxes_ignore)
         losses.update(losses_pts)
+
+        if self.scl_start_flag:
+            temporal_consistance_loss = self.spatial_consistance_loss(bev_feats_list[0], gt_labels_3d,corner_relation)
+            losses.update(temporal_consistance_loss)
+
+
         return losses
 
 @DETECTORS.register_module()

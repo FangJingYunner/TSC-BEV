@@ -94,6 +94,7 @@ class Custom3DDataset(Dataset):
                 'Please use MMCV>= 1.3.16 if you meet errors.')
             self.data_infos = self.load_annotations(self.ann_file)
 
+        # self.data_infos = self.data_infos[:10]
         # process pipeline
         if pipeline is not None:
             self.pipeline = Compose(pipeline)

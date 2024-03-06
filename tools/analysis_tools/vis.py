@@ -183,10 +183,18 @@ def main():
             l2g = get_lidar2global(infos)
             corners_lidar = corners_global @ np.linalg.inv(l2g).T
             corners_lidar = corners_lidar[:, :3]
+        # pred_flag = np.ones((corners_lidar.shape[0] // 8, ), dtype=np.bool)
+        # scores = [
+        #     pred_res[rid]['detection_score'] for rid in range(len(pred_res))
+        # ]
+        #
+        #
+        # corners_lidar = np.zeros((0, 3), dtype=np.float32)
         pred_flag = np.ones((corners_lidar.shape[0] // 8, ), dtype=np.bool)
         scores = [
-            pred_res[rid]['detection_score'] for rid in range(len(pred_res))
+            pred_res[rid]['detection_score'] for rid in range(len(pred_res)) #pred_res[rid]['detection_score'] for rid in range(len(corners_lidar))
         ]
+        args.draw_gt = True
         if args.draw_gt:
             gt_boxes = infos['gt_boxes']
             gt_boxes[:, -1] = gt_boxes[:, -1] + np.pi / 2

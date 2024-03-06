@@ -272,6 +272,8 @@ class LSSViewTransformer(BaseModule):
                                    self.interval_lengths)
 
             bev_feat = bev_feat.squeeze(2)
+            depth = depth.view(B*N, self.D, H, W)
+
         else:
             coor = self.get_lidar_coor(*input[1:7])#像素中的每个深度点对应ego坐标系中的coor的xyz点
             bev_feat = self.voxel_pooling_v2(
